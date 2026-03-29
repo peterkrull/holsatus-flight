@@ -21,21 +21,21 @@ mod params {
     crate::const_default!(
         Parameters => {
             roll: PidAxisParameters {
-                kp: 15.,
+                kp: 5.,
                 ki: 0.,
-                kd: 0.0,
+                kd: 0.02,
                 tau: 0.0001,
             },
             pitch: PidAxisParameters {
-                kp: 15.,
+                kp: 5.,
                 ki: 0.,
-                kd: 0.0,
+                kd: 0.02,
                 tau: 0.0001,
             },
             yaw: PidAxisParameters {
-                kp: 25.,
+                kp: 3.,
                 ki: 0.,
-                kd: 0.03,
+                kd: 0.01,
                 tau: 0.001,
             }
         }

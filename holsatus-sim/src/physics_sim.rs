@@ -175,7 +175,7 @@ impl Simulation {
         colliders.insert_with_parent(drone_collider, rb_handle, &mut bodies);
 
         // Let the body hit the floor
-        let floor = ColliderBuilder::cuboid(500., 500., 1.0)
+        let floor = ColliderBuilder::cuboid(1000., 1000., 1.0)
             .translation(vector![0., 0., 1.0])
             .build();
         colliders.insert(floor);

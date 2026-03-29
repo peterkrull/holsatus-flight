@@ -1,8 +1,9 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, f32::consts::PI};
 
+use common::nalgebra::{self, Rotation3, UnitQuaternion, Vector3};
 use embassy_time::Instant;
 use holsatus_sim::{Sim, SimHandle};
-use rerun::{Arrows3D, Color, LineStrips3D, Points3D, RecordingStream, Scalars, Vec3D};
+use rerun::{Arrows3D, Color, LineStrips3D, Points3D, RecordingStream, Scalars, Vec3D, components::RotationQuat};
 
 pub fn setup(
     handle: SimHandle,
@@ -34,10 +35,26 @@ impl RerunLogger {
         subsample: usize
     ) -> Result<Self, Box<dyn std::error::Error>> {
         rec.set_time("embassy-time", std::time::Duration::from_nanos(0));
+        rec.log_static("/", &rerun::ViewCoordinates::FRD())?;
+
+        let drone = rerun::Asset3D::from_file_path("sprinter.gltf")?;
+        rec.log("target", &drone)?;
+
+        let cam = rerun::Pinhole::from_fov_and_aspect_ratio(110.0f32.to_radians(), 16.0 / 9.0).with_image_plane_distance(0.5);
+        rec.log("target/camera", &cam)?;
+
+        let cam_rot = nalgebra::UnitQuaternion::from_euler_angles(3.0 * PI/2.0, 0.0, PI);
+        rec.log("target/camera", &rerun::Transform3D::from_translation([0.0, -1.7, 2.0]).with_quaternion(cam_rot.coords.data.0[0]))?;
 
         let drone = rerun::Asset3D::from_file_path("fpv-drone-2.gltf")?;
-        rec.log_static("/", &rerun::ViewCoordinates::FRD())?;
         rec.log("drone", &drone)?;
+
+        let cam = rerun::Pinhole::from_fov_and_aspect_ratio(90.0f32.to_radians(), 4.0 / 3.0).with_image_plane_distance(0.5);
+        rec.log("drone/camera", &cam)?;
+
+        let camera_pitch = 35.0f32.to_radians();
+        let cam_rot = nalgebra::UnitQuaternion::from_euler_angles(PI/2.0 + camera_pitch, 0.0, PI/2.0);
+        rec.log("drone/camera", &rerun::Transform3D::from_translation([0.1, 0.0, 0.0]).with_quaternion(cam_rot.coords.data.0[0]))?;
 
         Ok(RerunLogger {
             rec,
@@ -86,11 +103,22 @@ impl RerunLogger {
                 .log("sim/firmware/gyr", &Scalars::new(imu_data.gyr))?;
         }
 
+        if let Some((target_pos, target_vel)) = crate::TARGET_POSE.try_get() {
+            let yaw = -target_vel[0].atan2(target_vel[1]);
+            let rotation = UnitQuaternion::from_euler_angles(PI, 0.0, yaw);
+
+
+            self.rec.log(
+                "target",
+                &rerun::Transform3D::from_translation(target_pos).with_quaternion(rotation.coords.data.0[0])
+            )?;
+        }
+        
         if let Some(gyr_data) = common::signals::COMP_FUSE_GYR.try_get() {
             self.rec
                 .log("sim/firmware/gyr_comp", &Scalars::new(gyr_data))?;
         }
-
+        
         if let Some(estimate) = common::signals::ESKF_ESTIMATE.try_get() {
             self.rec.log(
                 "sim/firmware/eskf/pos",
@@ -119,33 +147,6 @@ impl RerunLogger {
             )?;
         }
 
-        if let Some(mpc_reference) = common::tasks::controller_mpc::MPC_REFERENCE.try_get() {
-            let reference =
-                mpc_reference.fixed_view::<3, { common::tasks::controller_mpc::HX }>(0, 0);
-            let slices = reference
-                .column_iter()
-                .map(|col| col.clone_owned().data.0[0]);
-
-            self.rec.log(
-                "sim/firmware/mpc_reference_dot",
-                &Points3D::new([reference.column(0).clone_owned().data.0[0]]).with_radii([0.05]),
-            )?;
-
-            self.rec
-                .log("sim/firmware/mpc_reference", &LineStrips3D::new([slices]))?;
-        }
-
-        if let Some(mpc_pos_pred) = common::tasks::controller_mpc::MPC_POS_PRED.try_get() {
-            let slices = mpc_pos_pred
-                .column_iter()
-                .map(|col| col.clone_owned().data.0[0]);
-
-            self.rec.log(
-                "sim/firmware/mpc_position_pred",
-                &LineStrips3D::new([slices]),
-            )?;
-        }
-
         if let Some(rate_sp) = common::signals::TRUE_RATE_SP.try_get() {
             self.rec
                 .log("sim/firmware/rate_sp", &Scalars::new(rate_sp))?;
@@ -157,14 +158,19 @@ impl RerunLogger {
                 .log("sim/firmware/angl_sp", &Scalars::new([roll, pitch, yaw]))?;
         }
 
-        if let Some(rate_sp) = common::signals::SLEW_RATE_SP.try_get() {
+        if let Some(rate_sp) = common::tasks::controller_rate::RATE_REF_FILTERED.try_get() {
             self.rec
-                .log("sim/firmware/slew_rate_sp", &Scalars::new(rate_sp))?;
+                .log("sim/firmware/rate_ref_filt", &Scalars::new(rate_sp))?;
         }
 
-        if let Some(rate_sp) = common::signals::FF_PRED_GYR.try_get() {
+        if let Some(rate_sp) = common::tasks::controller_rate::RATE_FF_PREDICT.try_get() {
             self.rec
-                .log("sim/firmware/gyro_ff_pred", &Scalars::new(rate_sp))?;
+                .log("sim/firmware/rate_ff_pred", &Scalars::new(rate_sp))?;
+        }
+
+        if let Some(rate_sp) = common::tasks::controller_rate::RATE_COMP_FUSE.try_get() {
+            self.rec
+                .log("sim/firmware/rate_comp_fuse", &Scalars::new(rate_sp))?;
         }
 
         if let Some(rate_sp) = common::signals::AHRS_ATTITUDE.try_get() {
@@ -243,23 +249,23 @@ impl RerunLogger {
             .log("sim/rotation", &Scalars::new([roll, pitch, yaw]))
             .unwrap();
 
-        // Note: do not place this in the 'drone/' path since that will also apply
-        // the drones rotation to this vector.
-        if let Some(mpc_acc_target) = common::tasks::controller_mpc::MPC_TARGET_ACC.try_get() {
-            let short_acc_target = mpc_acc_target.map(|x| x / 10.0);
-            self.rec.log(
-                "mpc_target_acc",
-                &Arrows3D::from_vectors([&short_acc_target])
-                    .with_radii([0.02])
-                    .with_origins([pos.data.0[0]]),
-            )?;
-        }
-
         self.rec.log(
             "drone",
             &rerun::Transform3D::from_translation(pos.data.0[0])
                 .with_quaternion(rot.coords.data.0[0]),
         )?;
+
+        if let Some((target_pos, _)) = crate::TARGET_POSE.try_get() {
+            // Determine the world-position of the drone-cameras focal point (0.1 in front of center)
+            let focal_point = pos + rot.transform_vector(&[0.1, 0.0, 0.0].into());
+            let line_of_sight = rerun::LineStrip3D::from_iter([target_pos, focal_point.data.0[0]]);
+
+            self.rec.log(
+                "line_of_sight",
+                &LineStrips3D::new([line_of_sight]),
+            )?;
+        }
+
 
         Ok(())
     }

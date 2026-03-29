@@ -47,25 +47,35 @@ pub mod params {
     impl Params {
         const fn const_default() -> Self {
             Params {
-                x: AxisParameters::const_default(),
-                y: AxisParameters::const_default(),
-                z: AxisParameters::const_default(),
-                ref_slew: 500.0,
+                x: AxisParameters {
+                    kp: 0.04,
+                    ki: 0.1,
+                    kd: 0.045,
+                    cfg: AxisFlags(0),
+                    dtau: 0.001,
+                    pred: 0.03,
+                    comp: 0.01,
+                },
+                y: AxisParameters {
+                    kp: 0.04,
+                    ki: 0.1,
+                    kd: 0.045,
+                    cfg: AxisFlags(0),
+                    dtau: 0.001,
+                    pred: 0.03,
+                    comp: 0.01,
+                },
+                z: AxisParameters {
+                    kp: 0.1,
+                    ki: 0.0,
+                    kd: 0.05,
+                    cfg: AxisFlags(0),
+                    dtau: 0.001,
+                    pred: 0.065,
+                    comp: 0.02,
+                },
+                ref_slew: 600.0,
                 ref_lp: 0.01,
-            }
-        }
-    }
-
-    impl AxisParameters {
-        const fn const_default() -> Self {
-            AxisParameters {
-                kp: 0.08,
-                ki: 0.5,
-                kd: 0.03,
-                cfg: AxisFlags(0),
-                dtau: 0.001,
-                pred: 0.04,
-                comp: 0.005,
             }
         }
     }
@@ -125,7 +135,7 @@ pub async fn main() {
         NthOrderLowpass::<_, 2>::new(params.ref_lp, dt),
     ];
 
-    let mut thrust_lp_filt = NthOrderLowpass::<_, 2>::new(params.ref_lp, dt * 100.);
+    let mut thrust_lp_filt = NthOrderLowpass::<_, 2>::new(params.ref_lp, dt);
 
     // Lowpass filters will act as feed-forward prediction.
     // We designed the closed loop system to have a bandwidth of 25Hz
@@ -196,22 +206,22 @@ pub async fn main() {
         }
 
         // Apply prediction, filtering and control pipeline
-        let pid_torque: [f32; 3] = from_fn(|axis| {
+        let pid_torque: [f32; 3] = from_fn(|ax| {
             // Make prediction of the gyroscope based on (previous) reference
-            ff_pred_gyr[axis] = pred_model[axis].update(ref_filtered[axis]);
+            ff_pred_gyr[ax] = pred_model[ax].update(ref_filtered[ax]);
 
             // Apply slew rate limiter to reference signal
-            let setpoint = rate_sp[axis].clamp(-MAX_GYR_MEAS, MAX_GYR_MEAS);
-            ref_filtered[axis] = sp_slew_filt[axis].update(setpoint);
+            let setpoint = rate_sp[ax].clamp(-MAX_GYR_MEAS, MAX_GYR_MEAS);
+            ref_filtered[ax] = sp_slew_filt[ax].update(setpoint);
 
             // Slew-rate limit the reference signal (avoids D-term clipping)
-            ref_filtered[axis] = sp_lp_filt[axis].update(ref_filtered[axis]);
+            ref_filtered[ax] = sp_lp_filt[ax].update(ref_filtered[ax]);
 
             // Fuse gyro and prediction using complementary filter
-            comp_fuse_gyr[axis] = comp[axis].update(imu_data.gyr[axis], ff_pred_gyr[axis]);
+            comp_fuse_gyr[ax] = comp[ax].update(imu_data.gyr[ax], ff_pred_gyr[ax]);
 
             // Update PID controller
-            pid[axis].update(ref_filtered[axis], comp_fuse_gyr[axis], ff_pred_gyr[axis])
+            pid[ax].update(ref_filtered[ax], comp_fuse_gyr[ax], ff_pred_gyr[ax])
         });
 
         let z_thrust_filt = thrust_lp_filt.update(-z_thrust_sp);
@@ -228,6 +238,7 @@ pub async fn main() {
             RATE_PID_TERMS.send(pid_terms);
             RATE_FF_PREDICT.send(ff_pred_gyr);
             RATE_REF_FILTERED.send(ref_filtered);
+            RATE_COMP_FUSE.send(comp_fuse_gyr);
         });
     }
 }
@@ -236,3 +247,4 @@ pub static RATE_MOTORS_MIXED: Watch<[f32; 4]> = Watch::new();
 pub static RATE_PID_TERMS: Watch<[PidTerms; 3]> = Watch::new();
 pub static RATE_FF_PREDICT: Watch<[f32; 3]> = Watch::new();
 pub static RATE_REF_FILTERED: Watch<[f32; 3]> = Watch::new();
+pub static RATE_COMP_FUSE: Watch<[f32; 3]> = Watch::new();
