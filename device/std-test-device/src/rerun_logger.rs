@@ -1,9 +1,9 @@
 use std::{collections::VecDeque, f32::consts::PI};
 
-use common::nalgebra::{self, Rotation3, UnitQuaternion, Vector3};
+use common::nalgebra::{self, UnitQuaternion};
 use embassy_time::Instant;
 use holsatus_sim::{Sim, SimHandle};
-use rerun::{Arrows3D, Color, LineStrips3D, Points3D, RecordingStream, Scalars, Vec3D, components::RotationQuat};
+use rerun::{Arrows3D, Color, LineStrips3D, RecordingStream, Scalars, Vec3D};
 
 pub fn setup(
     handle: SimHandle,
