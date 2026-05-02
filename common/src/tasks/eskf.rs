@@ -75,9 +75,11 @@ pub static CHANNEL: Channel<Message, 10> = Channel::new();
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct EskfEstimate {
+    pub timestamp_us: u64,
     pub pos: Vector3<f32>,
     pub vel: Vector3<f32>,
     pub att: UnitQuaternion<f32>,
+    pub ang_vel: Vector3<f32>,
     pub gyr_bias: Vector3<f32>,
     pub acc_bias: Vector3<f32>,
 }
@@ -233,8 +235,7 @@ pub async fn main() -> ! {
 
                 #[cfg(feature = "gnss")]
                 {
-                    position_provider |=
-                        gnss_fusion.time_elapsed() < Duration::from_secs(2);
+                    position_provider |= gnss_fusion.time_elapsed() < Duration::from_secs(2);
                 }
 
                 if position_valid && !position_provider {
@@ -261,15 +262,18 @@ pub async fn main() -> ! {
                     filter.velocity = [0.0; 3].into();
                     filter.acc_bias = [0.0; 3].into();
                     filter.gyr_bias = [0.0; 3].into();
-                    #[cfg(feature = "gnss")] {
+                    #[cfg(feature = "gnss")]
+                    {
                         gnss_fusion.reset_origin();
                     }
                 }
 
                 let estimate = EskfEstimate {
+                    timestamp_us: imu_data.timestamp_us,
                     pos: smooth_position.into(),
                     vel: filter.velocity,
                     att: filter.rotation,
+                    ang_vel: imu_data.gyr.into(),
                     gyr_bias: filter.gyr_bias,
                     acc_bias: filter.acc_bias,
                 };
@@ -302,17 +306,11 @@ pub async fn main() -> ! {
                 let rotation_var =
                     SMatrix::from_array_storage(nalgebra::ArrayStorage(vicon_data.att_var));
 
-                if filter.observe_position(
-                    position,
-                    position_var,
-                ).is_err() {
+                if filter.observe_position(position, position_var).is_err() {
                     error!("[eskf] Unable to do matrix inversion during ESKF position update");
                 }
 
-                if filter.observe_rotation(
-                    rotation,
-                    rotation_var,
-                ).is_err() {
+                if filter.observe_rotation(rotation, rotation_var).is_err() {
                     error!("[eskf] Unable to do matrix inversion during ESKF update");
                 }
 
@@ -323,7 +321,7 @@ pub async fn main() -> ! {
                 if gnss_fusion.fuse_measurement(&gnss_data, &mut filter) {
                     position_valid = true;
                 }
-            },
+            }
             #[cfg(feature = "gnss")]
             Message::GnssResetOrigin => gnss_fusion.reset_origin(),
         }
@@ -351,11 +349,14 @@ mod gnss_fusion {
     #[allow(unused_imports)]
     use num_traits::Float as _;
 
-    use crate::{tasks::eskf::{GnssPoint, KM_PER_DEG_OF_LAT, lat_factor}, types::measurements::GnssData};
+    use crate::{
+        tasks::eskf::{GnssPoint, KM_PER_DEG_OF_LAT, lat_factor},
+        types::measurements::GnssData,
+    };
 
     pub struct EskfGnssFusion {
         last_time: Instant,
-        origin: Option<GnssPoint>
+        origin: Option<GnssPoint>,
     }
 
     impl EskfGnssFusion {
@@ -374,7 +375,11 @@ mod gnss_fusion {
             self.last_time.elapsed()
         }
 
-        pub fn fuse_measurement(&mut self, gnss_data: &GnssData, filter: &mut NavigationFilter) -> bool {
+        pub fn fuse_measurement(
+            &mut self,
+            gnss_data: &GnssData,
+            filter: &mut NavigationFilter,
+        ) -> bool {
             use crate::types::measurements::GnssFix;
             const GNSS_MIN_NUM_SATELLITES: u8 = 3;
 
@@ -413,8 +418,7 @@ mod gnss_fusion {
             let down_delta = -delta.alt_delta;
 
             // Which is our current position, relative to origin
-            let position =
-                Vector3::new(north_delta, east_delta, down_delta);
+            let position = Vector3::new(north_delta, east_delta, down_delta);
 
             // Velocity is already in NED coordinates!
             let velocity = Vector3::new(
@@ -424,28 +428,25 @@ mod gnss_fusion {
             );
 
             // Interpret position accuracy as standard deviation
-            let position_var = SMatrix::from_diagonal(&[
-                (gnss_data.horizontal_accuracy).powi(2),
-                (gnss_data.horizontal_accuracy).powi(2),
-                (gnss_data.vertical_accuracy).powi(2),
-            ].into());
+            let position_var = SMatrix::from_diagonal(
+                &[
+                    (gnss_data.horizontal_accuracy).powi(2),
+                    (gnss_data.horizontal_accuracy).powi(2),
+                    (gnss_data.vertical_accuracy).powi(2),
+                ]
+                .into(),
+            );
 
             // The velocity variance is a bit more complex
             let velocity_var = Self::gnss_velocity_cov(&gnss_data);
 
             // These two observations together take 120-180 µs on an
             // stm32f405 with optim-level = 3, pretty good id say?
-            if filter.observe_position(
-                position,
-                position_var,
-            ).is_err() {
+            if filter.observe_position(position, position_var).is_err() {
                 error!("[eskf] Unable to do matrix inversion during ESKF velocity update");
             }
 
-            if filter.observe_velocity(
-                velocity, 
-                velocity_var
-            ).is_err() {
+            if filter.observe_velocity(velocity, velocity_var).is_err() {
                 error!("[eskf] Unable to do matrix inversion during ESKF velocity update");
             }
 
@@ -455,7 +456,7 @@ mod gnss_fusion {
         pub fn gnss_velocity_cov(gnss_data: &GnssData) -> SMatrix<f32, 3, 3> {
             let v_gs = gnss_data.ground_speed;
             let psi = gnss_data.heading_motion;
-            
+
             // Use a small minimum sigma to ensure numerical stability if accuracy is reported as 0.0
             let sigma_gs = gnss_data.ground_speed_accuracy.max(1e-3);
             let sigma_psi = gnss_data.heading_accuracy.max(1e-3);
@@ -481,9 +482,7 @@ mod gnss_fusion {
             let var_vd = sigma_gs_sq;
 
             SMatrix::<f32, 3, 3>::new(
-                var_vn,    cov_vn_ve, 0.0,
-                cov_vn_ve, var_ve,    0.0,
-                0.0,       0.0,       var_vd,
+                var_vn, cov_vn_ve, 0.0, cov_vn_ve, var_ve, 0.0, 0.0, 0.0, var_vd,
             )
         }
     }

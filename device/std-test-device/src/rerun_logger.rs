@@ -32,7 +32,7 @@ impl RerunLogger {
     pub fn new(
         rec: RecordingStream,
         handle: SimHandle,
-        subsample: usize
+        subsample: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         rec.set_time("embassy-time", std::time::Duration::from_nanos(0));
         rec.log_static("/", &rerun::ViewCoordinates::FRD())?;
@@ -40,21 +40,32 @@ impl RerunLogger {
         let drone = rerun::Asset3D::from_file_path("sprinter.gltf")?;
         rec.log("target", &drone)?;
 
-        let cam = rerun::Pinhole::from_fov_and_aspect_ratio(110.0f32.to_radians(), 16.0 / 9.0).with_image_plane_distance(0.5);
+        let cam = rerun::Pinhole::from_fov_and_aspect_ratio(110.0f32.to_radians(), 16.0 / 9.0)
+            .with_image_plane_distance(0.5);
         rec.log("target/camera", &cam)?;
 
-        let cam_rot = nalgebra::UnitQuaternion::from_euler_angles(3.0 * PI/2.0, 0.0, PI);
-        rec.log("target/camera", &rerun::Transform3D::from_translation([0.0, -1.7, 2.0]).with_quaternion(cam_rot.coords.data.0[0]))?;
+        let cam_rot = nalgebra::UnitQuaternion::from_euler_angles(3.0 * PI / 2.0, 0.0, PI);
+        rec.log(
+            "target/camera",
+            &rerun::Transform3D::from_translation([0.0, -1.7, 2.0])
+                .with_quaternion(cam_rot.coords.data.0[0]),
+        )?;
 
         let drone = rerun::Asset3D::from_file_path("fpv-drone-2.gltf")?;
         rec.log("drone", &drone)?;
 
-        let cam = rerun::Pinhole::from_fov_and_aspect_ratio(90.0f32.to_radians(), 4.0 / 3.0).with_image_plane_distance(0.5);
+        let cam = rerun::Pinhole::from_fov_and_aspect_ratio(90.0f32.to_radians(), 4.0 / 3.0)
+            .with_image_plane_distance(0.5);
         rec.log("drone/camera", &cam)?;
 
         let camera_pitch = 35.0f32.to_radians();
-        let cam_rot = nalgebra::UnitQuaternion::from_euler_angles(PI/2.0 + camera_pitch, 0.0, PI/2.0);
-        rec.log("drone/camera", &rerun::Transform3D::from_translation([0.1, 0.0, 0.0]).with_quaternion(cam_rot.coords.data.0[0]))?;
+        let cam_rot =
+            nalgebra::UnitQuaternion::from_euler_angles(PI / 2.0 + camera_pitch, 0.0, PI / 2.0);
+        rec.log(
+            "drone/camera",
+            &rerun::Transform3D::from_translation([0.1, 0.0, 0.0])
+                .with_quaternion(cam_rot.coords.data.0[0]),
+        )?;
 
         Ok(RerunLogger {
             rec,
@@ -67,19 +78,16 @@ impl RerunLogger {
     }
 
     pub fn log_subsampled(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-
         self.subsample_count += 1;
         if self.subsample_count < self.subsample_cfg {
-            return Ok(())
+            return Ok(());
         }
         self.subsample_count = 0;
 
         self.log_now()
     }
 
-
     pub fn log_now(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-
         let state = self.handle.vehicle_state();
         let pos = state.position;
         let rot = state.rotation;
@@ -107,18 +115,18 @@ impl RerunLogger {
             let yaw = -target_vel[0].atan2(target_vel[1]);
             let rotation = UnitQuaternion::from_euler_angles(PI, 0.0, yaw);
 
-
             self.rec.log(
                 "target",
-                &rerun::Transform3D::from_translation(target_pos).with_quaternion(rotation.coords.data.0[0])
+                &rerun::Transform3D::from_translation(target_pos)
+                    .with_quaternion(rotation.coords.data.0[0]),
             )?;
         }
-        
+
         if let Some(gyr_data) = common::signals::COMP_FUSE_GYR.try_get() {
             self.rec
                 .log("sim/firmware/gyr_comp", &Scalars::new(gyr_data))?;
         }
-        
+
         if let Some(estimate) = common::signals::ESKF_ESTIMATE.try_get() {
             self.rec.log(
                 "sim/firmware/eskf/pos",
@@ -260,12 +268,9 @@ impl RerunLogger {
             let focal_point = pos + rot.transform_vector(&[0.1, 0.0, 0.0].into());
             let line_of_sight = rerun::LineStrip3D::from_iter([target_pos, focal_point.data.0[0]]);
 
-            self.rec.log(
-                "line_of_sight",
-                &LineStrips3D::new([line_of_sight]),
-            )?;
+            self.rec
+                .log("line_of_sight", &LineStrips3D::new([line_of_sight]))?;
         }
-
 
         Ok(())
     }

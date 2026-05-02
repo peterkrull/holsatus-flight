@@ -1,7 +1,7 @@
-
-
 use common::hw_abstraction::Imu6Dof;
 use common::hw_abstraction::OutputGroup;
+use common::nalgebra::SMatrix;
+use common::nalgebra::SVector;
 use common::types::measurements::Imu6DofData;
 use common::types::measurements::ViconData;
 use embassy_time::Duration;
@@ -13,8 +13,6 @@ use holsatus_sim::SimulatedImu;
 use holsatus_sim::SimulatedMotors;
 use rand_distr::Distribution as _;
 use rand_distr::Normal;
-use common::nalgebra::SMatrix;
-use common::nalgebra::SVector;
 
 #[embassy_executor::task]
 pub async fn imu_reader(imu: SimulatedImu) {

@@ -5,12 +5,12 @@ use std::sync::{
 
 use clap::Parser;
 use common::{
-    nalgebra::{Point2, UnitQuaternion, Vector3},
-    sync::watch::Watch,
+    embassy_futures::select::{Either, select}, nalgebra::{Point2, UnitQuaternion, Vector3}, sync::{channel::Channel, watch::Watch}, tasks::eskf::EskfEstimate
 };
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Duration, Instant, Ticker, Timer};
 use holsatus_sim::{Resources, Sim, SimHandle};
+use rand::Rng;
 use rand_distr::{Distribution, Normal};
 use tokio::runtime::Runtime;
 
@@ -146,7 +146,6 @@ async fn flight_test_task() {
     log::debug!("============= Starting flight test =============");
     log::debug!("================================================");
 
-    let mut rcv_eskf_estimate = common::signals::ESKF_ESTIMATE.receiver();
     let mut rcv_motors_state = common::signals::MOTORS_STATE.receiver();
     let mut snd_attitude_sp = common::signals::TRUE_ATTITUDE_Q_SP.sender();
     let mut snd_z_thrust_sp = common::signals::TRUE_Z_THRUST_SP.sender();
@@ -181,72 +180,46 @@ async fn flight_test_task() {
         .fov_limit(40.0_f32.to_radians())
         .fov_penalty_gain(5.0);
 
-    let camera =
-        pronav::CameraSensor::new(1440.0, 1080.0, 90.0_f32.to_radians(), 35.0_f32.to_radians());
     let mut ab_filter = pronav::AlphaBetaLos::new(0.05); // Tuned down to suppress quantization noise from camera resolution
 
-    let delta = Duration::from_hz(60);
+    let delta = Duration::from_hz(100);
     let dt = delta.as_micros() as f32 * 1e-6;
 
-    let pos_gen = |index| {
-        let x = 600.0 - dt * index as f32 * 20.0;
-        let y = 100.0 - dt * index as f32 * 20.0;
-        Vector3::new(x, y, 0.0)
-    };
+    let mut ticker = Ticker::every(delta);
 
-    let pixel_disr = Normal::new(0.0, 2.0).unwrap();
-    let mut rng = rand::rng();
+    loop {
 
-    let mut index = 0;
-    let mut break_index = usize::MAX;
-    while index < break_index {
-        let estimate = rcv_eskf_estimate.get().await;
+        match select(EVENTS.receive(), ticker.next()).await {
+            Either::First(event) => {
+                match EVENTS.receive().await {
+                    Event::Camera {
+                        timestamp,
+                        target_pixel,
+                    } => {
+                        let attitude = ; // Interpolate / estimate attitude at timestamp
+                        let measured_los = CAMERA.pixel_to_global(target_pixel, attitude);
+                        let (los_unit, los_rate) = ab_filter.update(Some(measured_los), dt);
+                    }
+                    Event::Attitude {
+                        timestamp,
+                        attitude,
+                        angular_vel,
+                    } => {}
+                    Event::Quit => break,
+                }
+            }
+            Either::Second(()) => {
+                let closing_vel = 30.0; // Assume we have an air speed sensor
+                let attitude = ; // Interpolate / estimate attitude at timestamp
+                let (att, force) = pronav.update(closing_vel, los_unit, los_rate, attitude, dt);
 
-        let mut target_pos = pos_gen(index);
-        let target_vel = (target_pos - pos_gen(index - 1)) * dt.recip();
+                // Ensure we have attitude authority
+                let force = force.min(25.0);
 
-        TARGET_POSE.send((target_pos.into(), target_vel.into()));
-
-        // Raise target pos artificially for now
-        target_pos[2] -= 2.0;
-
-        if (estimate.pos - target_pos).norm() < 2.0 && break_index == usize::MAX {
-            log::info!("Target struck!");
-            break_index = index + 10;
+                snd_attitude_sp.send(att);
+                snd_z_thrust_sp.send(force);
+            }
         }
-
-        // 1. Vision emulation: Get target in global space, find its pixel
-        let focal_point = estimate.pos + estimate.att.transform_vector(&[0.1, 0.0, 0.0].into());
-        let exact_pixel = camera.project_to_pixel(target_pos, focal_point, estimate.att);
-
-        // Add noise to sensor coordinate
-        let noisy_pixel = exact_pixel.map(|(u, v)| {
-            (
-                u + pixel_disr.sample(&mut rng),
-                v + pixel_disr.sample(&mut rng),
-            )
-        });
-
-        // 2. Vision processing: Convert back to a measured LOS and run through the AB filter
-        let measured_los =
-            noisy_pixel.map(|p| camera.pixel_to_global(Point2::new(p.0, p.1), estimate.att));
-        let (los_unit, los_rate) = ab_filter.update(measured_los, dt);
-
-        if noisy_pixel.is_none() {
-            log::warn!("Target lost! Dead reckoning LOS.");
-        }
-
-        // 3. Guidance: Update ProNav with our filtered LOS estimations
-        let (att, force) = pronav.update(target_pos, los_unit, los_rate, estimate, dt);
-
-        // Ensure we have attitude authority
-        let force = force.min(25.0);
-
-        snd_attitude_sp.send(att);
-        snd_z_thrust_sp.send(force);
-
-        Timer::after(delta).await;
-        index += 1;
     }
 
     RUNNING.store(false, Ordering::Relaxed);
@@ -267,6 +240,113 @@ async fn flight_test_task() {
     Timer::after_secs(5).await;
 
     RUNNING.store(false, Ordering::Relaxed);
+}
+
+const CAMERA: LazyLock<pronav::CameraModel> = LazyLock::new(|| {
+    pronav::CameraModel::new(1440.0, 1080.0, 90.0_f32.to_radians(), 35.0_f32.to_radians())
+});
+
+pub enum Event {
+    Quit,
+    Camera {
+        timestamp: Instant,
+        target_pixel: Point2<f32>,
+    },
+    Attitude {
+        timestamp: Instant,
+        attitude: UnitQuaternion<f32>,
+        angular_vel: Vector3<f32>,
+    },
+}
+
+static EVENTS: Channel<Event, 2> = Channel::new();
+
+#[embassy_executor::task]
+async fn camera_task() {
+    let mut rcv_eskf_estimate = common::signals::ESKF_ESTIMATE.receiver();
+
+    let delta = Duration::from_hz(50);
+    let dt = delta.as_micros() as f32 * 1e-6;
+
+    let pos_gen = |index| {
+        let x = 600.0 - dt * index as f32 * 20.0;
+        let y = 100.0 - dt * index as f32 * 20.0;
+        Vector3::new(x, y, 0.0)
+    };
+
+    let pixel_disr = Normal::new(0.0, 2.0).unwrap();
+    let mut rng = rand::rng();
+
+    let mut index = 0;
+    let mut ticker = Ticker::every(delta);
+    loop {
+        ticker.next().await;
+
+        let estimate = rcv_eskf_estimate.get().await;
+
+        let mut target_pos = pos_gen(index);
+        let target_vel = (target_pos - pos_gen(index - 1)) * dt.recip();
+
+        // Publish so visualization can show target
+        TARGET_POSE.send((target_pos.into(), target_vel.into()));
+
+        // Raise target pos artificially for better centering
+        target_pos[2] -= 2.0;
+
+        if (estimate.pos - target_pos).norm() < 2.0 {
+            log::info!("Target struck!");
+            EVENTS.send(Event::Quit).await;
+            break;
+        }
+
+        // 1. Vision emulation: Get target in global space, find its pixel
+        let focal_point = estimate.pos + estimate.att.transform_vector(&[0.1, 0.0, 0.0].into());
+        if let Some(exact_pixel) = CAMERA.project_to_pixel(target_pos - focal_point, estimate.att) {
+            let noisy_pixel = Point2::new(
+                exact_pixel.0 + pixel_disr.sample(&mut rng),
+                exact_pixel.1 + pixel_disr.sample(&mut rng),
+            );
+
+            let event = Event::Camera {
+                timestamp: Instant::now(),
+                target_pixel: noisy_pixel,
+            };
+
+            // Add time delay and random jitter: 30 + 0..10 ms
+            Timer::after_micros(30_000 + rng.next_u64() % 10_000).await;
+
+            EVENTS.send(event).await;
+        }
+
+        index += 1;
+    }
+}
+
+#[embassy_executor::task]
+async fn attitude_task() {
+    let mut rcv_eskf_estimate = common::signals::ESKF_ESTIMATE.receiver();
+
+    let mut rng = rand::rng();
+
+    let delta = Duration::from_hz(100);
+    let mut ticker = Ticker::every(delta);
+
+    loop {
+        ticker.next().await;
+
+        let estimate = rcv_eskf_estimate.get().await;
+
+        let event = Event::Attitude {
+            timestamp: Instant::from_micros(estimate.timestamp_us),
+            attitude: estimate.att.into(),
+            angular_vel: estimate.ang_vel.into(),
+        };
+
+        // Add time delay and random jitter: 10 + 0..2 ms
+        Timer::after_micros(10_000 + rng.next_u64() % 2_000).await;
+
+        EVENTS.send(event).await;
+    }
 }
 
 pub static TARGET_POSE: Watch<([f32; 3], [f32; 3])> = Watch::new();

@@ -5,7 +5,7 @@ use common::{
     tasks::eskf::EskfEstimate,
 };
 
-pub struct CameraSensor {
+pub struct CameraModel {
     pub width: f32,
     pub height: f32,
     pub f_x: f32,
@@ -15,7 +15,7 @@ pub struct CameraSensor {
     pub pitch_offset: f32,
 }
 
-impl CameraSensor {
+impl CameraModel {
     pub fn new(width: f32, height: f32, vfov_rad: f32, pitch_offset: f32) -> Self {
         let f_y = height / (2.0 * (vfov_rad / 2.0).tan());
         let f_x = f_y; // Assume square pixels
@@ -34,11 +34,9 @@ impl CameraSensor {
     /// Emulates the camera sensor, returning Some(u,v) pixel coordinate if the target is in view.
     pub fn project_to_pixel(
         &self,
-        target_pos: Vector3<f32>,
-        focal_point: Vector3<f32>,
+        los_global: Vector3<f32>,
         att: UnitQuaternion<f32>,
     ) -> Option<(f32, f32)> {
-        let los_global = target_pos - focal_point;
         let los_body = att.inverse_transform_vector(&los_global);
 
         // Apply camera pitch (pitching up is positive rotation around body Y)
@@ -260,10 +258,10 @@ impl ProNav {
 
     pub fn update(
         &mut self,
-        target_pos: Vector3<f32>,
+        closing_vel: f32,
         los_unit: Vector3<f32>,
         los_unit_vel: Vector3<f32>,
-        estimate: EskfEstimate,
+        attitude: UnitQuaternion<f32>,
         dt: f32,
     ) -> (UnitQuaternion<f32>, f32) {
         if matches!(self.phase, FlightPhase::Cruise) {
@@ -277,19 +275,6 @@ impl ProNav {
         // =============================================================
         // This section applies a fairly standard "True ProNav" strategy
         // =============================================================
-
-        // Global target velocity [m/s]
-        let target_vel = self
-            .prev_target
-            .map(|prev_target| (target_pos - prev_target) / dt.max(1e-4))
-            .unwrap_or_default();
-        self.prev_target = Some(target_pos);
-
-        // Relative velocity [m/s]
-        let relative_vel = estimate.vel - target_vel;
-
-        // Closing Velocity [m/s]
-        let closing_vel = los_unit.dot(&relative_vel);
 
         // Acceleration contribution of the PN guidance law [m/s^2]
         let pronav_accel = self.pronav_gain * closing_vel * los_unit_vel;
@@ -307,20 +292,11 @@ impl ProNav {
 
         let intnav_accel = self.intnav_gain * closing_vel * self.los_vel_integral;
 
-        // Calculate the alignment between where we are going and where the target is
-        let vel_unit = estimate.vel.try_normalize(1e-3).unwrap_or(los_unit);
-        let vel_los_alignment = vel_unit.dot(&los_unit).max(0.0);
-
-        // Acceleration contribution of alisnment-based velocity law [m/s^2]
-        let velocity_error = self.velocity_target - estimate.vel.norm();
-        let axial_accel =
-            velocity_error * self.velocity_gain * vel_los_alignment * los_unit.normalize();
-
         // Acceleration contribution of pure pursuit [m/s^2]
         let pursuit_accel = self.pursuit_gain * los_unit;
 
         // Desired scceleration [m/s^2]
-        let mut desired_accel = pronav_accel + intnav_accel + axial_accel + pursuit_accel;
+        let mut desired_accel = pronav_accel + intnav_accel + pursuit_accel;
 
         // Disallow the pronav control law from setting the altitude acceleration in cruise mode
         if matches!(self.phase, FlightPhase::Cruise) {
@@ -338,7 +314,7 @@ impl ProNav {
         // FOV Constraint Penalty using Leaky Integrator
         // 1. Calculate camera boresight global vector
         let boresight_body = Vector3::new(self.camera_pitch.cos(), 0.0, -self.camera_pitch.sin());
-        let boresight_global = estimate.att.transform_vector(&boresight_body);
+        let boresight_global = attitude.transform_vector(&boresight_body);
 
         // 2. Measure violation outside of FOV cone
         let angle = boresight_global.angle(&los_unit);
@@ -376,7 +352,7 @@ impl ProNav {
 
         // Determine the alignment between the desired attitude and the current one.
         // Use that to scale down the force target while ill-aligned
-        let direction = estimate.att.transform_vector(&-Vector3::z());
+        let direction = attitude.transform_vector(&-Vector3::z());
         let alignment_factor = direction.dot(&desired_thrust_dir).clamp(0.0, 1.0);
 
         // Thrust (body -Z) points toward desired_thrust_dir
@@ -398,9 +374,7 @@ impl ProNav {
         let att_target = UnitQuaternion::from_matrix(&rotation_matrix);
 
         // Compensate for additional air resistance at higher speeds
-        let comp_accel_target =
-            global_accel_target.norm() * (1.0 + (estimate.vel.norm() * self.velocity_comp).powi(2));
-        let force_target = self.drone_mass * comp_accel_target * alignment_factor;
+        let force_target = self.drone_mass * alignment_factor;
 
         (att_target, force_target)
     }
