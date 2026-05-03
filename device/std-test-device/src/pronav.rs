@@ -33,13 +33,8 @@ impl CameraModel {
     }
 
     /// Emulates the camera sensor, returning Some(u,v) pixel coordinate if the target is in view.
-    pub fn project_to_pixel(
-        &self,
-        los_global: Vector3<f32>,
-        attitude: UnitQuaternion<f32>,
-    ) -> Option<(f32, f32)> {
-        let los_global = los_global.normalize();
-        let los_body = attitude.inverse_transform_vector(&los_global);
+    pub fn project_to_pixel(&self, los_body: Vector3<f32>) -> Option<Point2<f32>> {
+        let los_body = los_body.normalize();
 
         // Apply camera pitch (pitching up is positive rotation around body Y)
         let pitch_quat = UnitQuaternion::from_axis_angle(&Vector3::y_axis(), self.pitch_rad);
@@ -67,11 +62,11 @@ impl CameraModel {
             return None;
         }
 
-        Some((u, v))
+        Some(Point2::new(u, v))
     }
 
     /// Converts a pixel measurement (if available) back to a global LOS vector
-    pub fn pixel_to_global(&self, pixel: Point2<f32>, att: UnitQuaternion<f32>) -> Vector3<f32> {
+    pub fn pixel_to_los_body(&self, pixel: Point2<f32>) -> Vector3<f32> {
         let [[u, v]] = pixel.coords.data.0;
 
         // Map pixel back to a 3D ray in the camera frame
@@ -85,10 +80,7 @@ impl CameraModel {
         // Apply inverse of camera pitch - must match the pitch used in project_to_pixel!
         let pitch_rot = Rotation3::from_euler_angles(0.0, self.pitch_rad, 0.0);
 
-        let los_body = pitch_rot.matrix() * los_cam_aligned;
-
-        // Body to Global
-        att.transform_vector(&los_body)
+        pitch_rot.matrix() * los_cam_aligned
     }
 }
 
@@ -160,39 +152,35 @@ impl AttitudeBuffer {
     /// SLERP-interpolate attitude and LERP-interpolate angular velocity
     /// at the requested timestamp. Returns `None` if the buffer is empty or
     /// the timestamp is before the first stored entry.
-    pub fn interpolate_at(
-        &self,
-        timestamp: Instant,
-    ) -> Option<(UnitQuaternion<f32>, Vector3<f32>)> {
+    pub fn interpolate_at(&self, timestamp: Instant) -> Option<UnitQuaternion<f32>> {
         if self.entries.is_empty() {
             return None;
         }
 
+        // This is okay due to the !empty check
         let first = self.entries.front().unwrap();
         let last = self.entries.back().unwrap();
 
-        // Clamp: if before the earliest entry, return the earliest
+        // If before the earliest entry, return the earliest
         if timestamp <= first.timestamp {
-            return Some((first.attitude, first.angular_vel));
+            return Some(first.attitude);
         }
 
-        // Clamp: if at or after the latest entry, extrapolate using angular velocity
+        // If at or after the latest entry, extrapolate using angular velocity
         if timestamp >= last.timestamp {
             let dt = (timestamp - last.timestamp).as_micros() as f32 * 1e-6;
-            if dt < 1e-9 {
-                return Some((last.attitude, last.angular_vel));
-            }
-            // Small-angle extrapolation: apply angular velocity as a rotation
+
+            // Apply angular velocity as a rotation
             let delta_angle = last.angular_vel * dt;
-            let mag = delta_angle.norm();
-            let extrapolated = if mag > 1e-9 {
+            let delta_angle_norm = delta_angle.norm();
+            let extrapolated = if delta_angle_norm > 1e-9 {
                 let axis = UnitVector3::new_normalize(delta_angle);
-                let rot = UnitQuaternion::from_axis_angle(&axis, mag);
+                let rot = UnitQuaternion::from_axis_angle(&axis, delta_angle_norm);
                 last.attitude * rot
             } else {
                 last.attitude
             };
-            return Some((extrapolated, last.angular_vel));
+            return Some(extrapolated);
         }
 
         // Binary search for the two bracketing entries
@@ -204,7 +192,7 @@ impl AttitudeBuffer {
         // Exact match
         if upper < self.entries.len() && self.entries[upper].timestamp == timestamp {
             let e = &self.entries[upper];
-            return Some((e.attitude, e.angular_vel));
+            return Some(e.attitude);
         }
 
         let lower = upper.saturating_sub(1);
@@ -213,300 +201,15 @@ impl AttitudeBuffer {
 
         let span = (b.timestamp - a.timestamp).as_micros() as f32;
         if span < 1.0 {
-            return Some((a.attitude, a.angular_vel));
+            return Some(a.attitude);
         }
 
         let t = (timestamp - a.timestamp).as_micros() as f32 / span;
         let t = t.clamp(0.0, 1.0);
 
         let att = a.attitude.slerp(&b.attitude, t);
-        let ang = a.angular_vel.lerp(&b.angular_vel, t);
 
-        Some((att, ang))
-    }
-}
-
-// =============================================================================
-// Rewindable Alpha-Beta LOS filter with out-of-sequence measurement support
-// =============================================================================
-
-/// A snapshot of the filter state at a given point in time.
-#[derive(Clone)]
-struct LosFilterSnapshot {
-    timestamp: Instant,
-    unit_est: Option<Vector3<f32>>,
-    rate_est: Vector3<f32>,
-}
-
-/// A measurement (or coast/predict step) that was applied to the filter.
-#[derive(Clone)]
-struct LosFilterInput {
-    timestamp: Instant,
-    measurement: Option<Vector3<f32>>, // None = coast/predict step
-}
-
-pub struct AlphaBetaLos {
-    alpha: f32,
-    beta: f32,
-    /// Current filter state
-    unit_est: Option<Vector3<f32>>,
-    rate_est: Vector3<f32>,
-    /// Timestamp of the current state
-    current_time: Option<Instant>,
-    /// History of filter states for rollback
-    snapshots: VecDeque<LosFilterSnapshot>,
-    /// History of inputs for replay after rollback
-    inputs: VecDeque<LosFilterInput>,
-    /// Maximum number of history entries to retain
-    max_history: usize,
-}
-
-impl AlphaBetaLos {
-    /// Construct a new alpha-beta filter.
-    ///
-    /// Larger values of `alpha` will make the filter more responsive, but also potentially noisier.
-    pub fn new(alpha: f32) -> Self {
-        let alpha = alpha.clamp(0.0, 1.0);
-        Self {
-            alpha,
-            beta: (alpha * alpha) / (2.0 - alpha),
-            unit_est: None,
-            rate_est: Vector3::new(0.0, 0.0, 0.0),
-            current_time: None,
-            snapshots: VecDeque::with_capacity(256),
-            inputs: VecDeque::with_capacity(256),
-            max_history: 256,
-        }
-    }
-
-    /// Reset the filter's internal state and history.
-    pub fn reset(&mut self) {
-        self.unit_est = None;
-        self.rate_est = Vector3::new(0.0, 0.0, 0.0);
-        self.current_time = None;
-        self.snapshots.clear();
-        self.inputs.clear();
-    }
-
-    /// Internal single-step predict-correct cycle. This is the original `update()` logic.
-    fn step(&mut self, measurement: Option<Vector3<f32>>, dt: f32) -> (Vector3<f32>, Vector3<f32>) {
-        if let Some(unit_est) = self.unit_est {
-            // Predict the value based on prior state and velocity
-            let val_pred = (unit_est + (self.rate_est * dt)).normalize();
-
-            if let Some(meas) = measurement {
-                // We have a track: apply prediction + correction
-                let residual = meas - val_pred;
-
-                let new_est = (val_pred + (self.alpha * residual)).normalize();
-
-                // Update the rate, then strip any component that goes *along* the LOS vector
-                // to prevent rate_est from accumulating length-changing velocity on the sphere
-                let mut new_rate = if dt > 1e-9 {
-                    self.rate_est + (self.beta * residual) / dt
-                } else {
-                    self.rate_est
-                };
-                new_rate = new_rate - new_est * new_est.dot(&new_rate);
-
-                self.rate_est = new_rate;
-                self.unit_est = Some(new_est);
-
-                (new_est, self.rate_est)
-            } else {
-                // Tracking lost: Coast forward using dead-reckoning prediction only
-                self.unit_est = Some(val_pred);
-
-                // Keep the rate orthogonal
-                let mut coast_rate = self.rate_est;
-                coast_rate = coast_rate - val_pred * val_pred.dot(&coast_rate);
-                self.rate_est = coast_rate;
-
-                (val_pred, self.rate_est)
-            }
-        } else {
-            // No prior state initialized
-            if let Some(meas) = measurement {
-                self.unit_est = Some(meas);
-                (meas, self.rate_est)
-            } else {
-                // Completely blind from the start. Return Forward direction as a safe default.
-                (Vector3::new(1.0, 0.0, 0.0), Vector3::zeros())
-            }
-        }
-    }
-
-    /// Save the current state as a snapshot at the given timestamp.
-    fn save_snapshot(&mut self, timestamp: Instant) {
-        self.snapshots.push_back(LosFilterSnapshot {
-            timestamp,
-            unit_est: self.unit_est,
-            rate_est: self.rate_est,
-        });
-        while self.snapshots.len() > self.max_history {
-            self.snapshots.pop_front();
-        }
-    }
-
-    /// Record an input for potential future replay.
-    fn record_input(&mut self, timestamp: Instant, measurement: Option<Vector3<f32>>) {
-        // Insert in chronological order (fast-path: append)
-        let input = LosFilterInput {
-            timestamp,
-            measurement,
-        };
-        if self
-            .inputs
-            .back()
-            .map_or(true, |i| i.timestamp <= timestamp)
-        {
-            self.inputs.push_back(input);
-        } else {
-            let pos = self
-                .inputs
-                .binary_search_by(|i| i.timestamp.cmp(&timestamp))
-                .unwrap_or_else(|i| i);
-            self.inputs.insert(pos, input);
-        }
-        while self.inputs.len() > self.max_history {
-            self.inputs.pop_front();
-        }
-    }
-
-    /// Restore filter state from a snapshot.
-    fn restore_snapshot(&mut self, snapshot: &LosFilterSnapshot) {
-        self.unit_est = snapshot.unit_est;
-        self.rate_est = snapshot.rate_est;
-        self.current_time = Some(snapshot.timestamp);
-    }
-
-    /// Fuse a measurement at its true timestamp. If the measurement is older
-    /// than the current filter time, this performs a rollback-and-replay to
-    /// incorporate it at the correct chronological point.
-    ///
-    /// Returns the updated (los_unit, los_rate) estimate at the latest time.
-    pub fn fuse(
-        &mut self,
-        timestamp: Instant,
-        measurement: Option<Vector3<f32>>,
-    ) -> (Vector3<f32>, Vector3<f32>) {
-        let is_oosm = self.current_time.map_or(false, |t| timestamp < t);
-
-        if !is_oosm {
-            // In-order measurement: simple forward step
-            let dt = self
-                .current_time
-                .map(|t| (timestamp - t).as_micros() as f32 * 1e-6)
-                .unwrap_or(0.0);
-
-            let result = self.step(measurement, dt);
-            self.current_time = Some(timestamp);
-
-            // Save state AFTER the step has been applied
-            self.save_snapshot(timestamp);
-            self.record_input(timestamp, measurement);
-            return result;
-        }
-
-        // === Out-of-sequence measurement: rollback and replay ===
-
-        // 1. Record the new input in chronological order
-        self.record_input(timestamp, measurement);
-
-        // 2. Find the latest snapshot strictly BEFORE the measurement timestamp
-        let rollback_idx = self.snapshots.iter().rposition(|s| s.timestamp < timestamp);
-
-        let replay_start_time = if let Some(idx) = rollback_idx {
-            let snap = self.snapshots[idx].clone();
-            self.restore_snapshot(&snap);
-            // Discard all snapshots after the rollback point (they'll be regenerated)
-            self.snapshots.truncate(idx + 1);
-            snap.timestamp
-        } else {
-            // No snapshot old enough — reset to initial state and replay everything
-            self.unit_est = None;
-            self.rate_est = Vector3::zeros();
-            self.current_time = None;
-            self.snapshots.clear();
-            // Replay from the very first input
-            self.inputs
-                .front()
-                .map(|i| i.timestamp)
-                .unwrap_or(timestamp)
-        };
-
-        // 3. Collect inputs to replay (all inputs strictly after replay_start_time)
-        let inputs_to_replay: Vec<LosFilterInput> = self
-            .inputs
-            .iter()
-            .filter(|i| i.timestamp > replay_start_time)
-            .cloned()
-            .collect();
-
-        // 4. Replay all inputs in chronological order
-        let mut result = self.current_estimate();
-        for input in &inputs_to_replay {
-            let dt = self
-                .current_time
-                .map(|t| {
-                    if input.timestamp > t {
-                        (input.timestamp - t).as_micros() as f32 * 1e-6
-                    } else {
-                        0.0
-                    }
-                })
-                .unwrap_or(0.0);
-
-            result = self.step(input.measurement, dt);
-            self.current_time = Some(input.timestamp);
-            self.save_snapshot(input.timestamp);
-        }
-
-        result
-    }
-
-    /// Coast/predict the filter forward to `now` without incorporating a
-    /// measurement. Use this from the controller tick to get the latest estimate
-    /// extrapolated to the current time.
-    ///
-    /// This does **not** record a coast step in the input history, so it won't
-    /// interfere with future OOSM replays. It advances `current_time`.
-    pub fn predict_to(&mut self, now: Instant) -> (Vector3<f32>, Vector3<f32>) {
-        let dt = self
-            .current_time
-            .map(|t| {
-                if now > t {
-                    (now - t).as_micros() as f32 * 1e-6
-                } else {
-                    0.0
-                }
-            })
-            .unwrap_or(0.0);
-
-        if dt < 1e-9 {
-            return self.current_estimate();
-        }
-
-        // Predict forward without recording — this is a "peek" extrapolation
-        if let Some(unit_est) = self.unit_est {
-            let val_pred = (unit_est + (self.rate_est * dt)).normalize();
-
-            // Keep rate orthogonal to the predicted direction
-            let mut coast_rate = self.rate_est;
-            coast_rate = coast_rate - val_pred * val_pred.dot(&coast_rate);
-
-            (val_pred, coast_rate)
-        } else {
-            (Vector3::new(1.0, 0.0, 0.0), Vector3::zeros())
-        }
-    }
-
-    /// Read the current best estimate without mutating state.
-    pub fn current_estimate(&self) -> (Vector3<f32>, Vector3<f32>) {
-        (
-            self.unit_est.unwrap_or_else(|| Vector3::new(1.0, 0.0, 0.0)),
-            self.rate_est,
-        )
+        Some(att)
     }
 }
 
@@ -548,7 +251,7 @@ impl ProNav {
             camera_pitch: 0.0,
             fov_limit: 45.0f32.to_radians(),
             fov_penalty_gain: 10.0,
-            fov_leak_rate: 1.0,
+            fov_leak_rate: 0.25,
             fov_integral: 0.0,
             los_vel_integral: Vector3::new(0.0, 0.0, 0.0),
             phase: FlightPhase::Cruise,
@@ -603,6 +306,7 @@ impl ProNav {
         attitude: UnitQuaternion<f32>,
         dt: f32,
     ) -> (UnitQuaternion<f32>, f32) {
+        // Traisition phase based on LOS elevation
         if matches!(self.phase, FlightPhase::Cruise) {
             let los_elevation_abs = los_unit.z.abs().asin();
             if los_elevation_abs > 20.0_f32.to_radians() {
@@ -611,18 +315,30 @@ impl ProNav {
             }
         }
 
+        // =================================================================
+        // 1. Evaluate Camera FOV Constraints first
+        // =================================================================
+        let boresight_body = Vector3::new(self.camera_pitch.cos(), 0.0, -self.camera_pitch.sin());
+        let boresight_global = attitude.transform_vector(&boresight_body);
+
+        let angle = boresight_global.angle(&los_unit);
+        let violation = angle - self.fov_limit;
+        let penalty_input = violation.max(0.0);
+
         // =============================================================
         // This section applies a fairly standard "True ProNav" strategy
         // =============================================================
 
-        match self.phase {
-            FlightPhase::Cruise => {
-                let mut los_unit_vel_cruise = los_unit_vel;
-                los_unit_vel_cruise.z = 0.0;
-                self.los_vel_integral += los_unit_vel_cruise * dt;
-            }
-            FlightPhase::Terminal => {
-                self.los_vel_integral += los_unit_vel * dt;
+        if penalty_input == 0.0 {
+            match self.phase {
+                FlightPhase::Cruise => {
+                    let mut los_unit_vel_cruise = los_unit_vel;
+                    los_unit_vel_cruise.z = 0.0;
+                    self.los_vel_integral += los_unit_vel_cruise * dt;
+                }
+                FlightPhase::Terminal => {
+                    self.los_vel_integral += los_unit_vel * dt;
+                }
             }
         }
 
@@ -630,40 +346,28 @@ impl ProNav {
         let pronav_accel = self.pronav_gain * closing_vel * los_unit_vel;
         let intnav_accel = self.intnav_gain * closing_vel * self.los_vel_integral;
 
+        let velocity_accel = self.velocity_gain * (self.velocity_target - closing_vel) * los_unit;
+
         // Acceleration contribution of pure pursuit [m/s^2]
         let pursuit_accel = self.pursuit_gain * los_unit;
 
         // Desired scceleration [m/s^2]
-        let mut desired_accel = pronav_accel + intnav_accel + pursuit_accel;
+        let mut desired_accel = pronav_accel + intnav_accel + pursuit_accel + velocity_accel;
 
         // Disallow the pronav control law from setting the altitude acceleration in cruise mode
         if matches!(self.phase, FlightPhase::Cruise) {
             desired_accel.z = 0.0;
         }
 
-        // =================================================================
-        // This section converts the desired accel into an attitude + thrust
-        // =================================================================
-
         // Add gravity back into the desired accel
         let gravity_vector = Vector3::z() * 9.81;
         let mut global_accel_target = desired_accel - gravity_vector;
 
-        // FOV Constraint Penalty using Leaky Integrator
-        // 1. Calculate camera boresight global vector
-        let boresight_body = Vector3::new(self.camera_pitch.cos(), 0.0, -self.camera_pitch.sin());
-        let boresight_global = attitude.transform_vector(&boresight_body);
+        // =================================================================
+        // This section converts the desired accel into an attitude + thrust
+        // =================================================================
 
-        // 2. Measure violation outside of FOV cone
-        let angle = boresight_global.angle(&los_unit);
-        let violation = angle - self.fov_limit;
-
-        // 3. Continuous Leaky Integrator
-        // Input is the severity of the FOV violation (0 if safely inside)
-        let penalty_input = violation.max(0.0);
-
-        // Standard leaky integrator: dx/dt = input - leak_rate * state
-        // This ensures a continuous gradient and asymptotic decay without harsh switching
+        // Update FOV Leaky Integrator
         self.fov_integral += (penalty_input - self.fov_leak_rate * self.fov_integral) * dt;
         self.fov_integral = self.fov_integral.max(0.0);
 
@@ -719,7 +423,7 @@ impl ProNav {
 }
 
 /// Run this ONLY on initialization to establish the initial tangent plane
-fn compute_initial_basis(u: &Vector3<f32>) -> SMatrix<f32, 3, 2> {
+fn initial_basis(u: &Vector3<f32>) -> SMatrix<f32, 3, 2> {
     let mut v = Vector3::new(1.0, 0.0, 0.0);
     if u.x.abs() > 0.9 {
         v = Vector3::new(0.0, 1.0, 0.0);
@@ -742,7 +446,7 @@ fn skew_symmetric(v: &Vector3<f32>) -> Matrix3<f32> {
 #[derive(Debug, Clone)]
 pub struct EskfLos {
     /// Global nominal 3D unit LOS vector
-    pub u_hat: Vector3<f32>,
+    pub los_hat: Vector3<f32>,
     /// Global nominal 3D LOS angular rate
     pub omega_hat: Vector3<f32>,
     /// Basis for the tangent space of the unit sphere at u_hat
@@ -756,19 +460,20 @@ pub struct EskfLos {
 impl EskfLos {
     /// Construct a new ESKF LOS tracker.
     pub fn new(q_cov: SMatrix<f32, 4, 4>) -> Self {
-        let u_initial = Vector3::new(1.0, 0.0, 0.0);
+        let los_initial = Vector3::new(1.0, 0.0, 0.0);
         Self {
-            u_hat: u_initial,
+            los_hat: los_initial,
             omega_hat: Vector3::zeros(),
-            basis: compute_initial_basis(&u_initial),
+            basis: initial_basis(&los_initial),
             p_cov: SMatrix::identity(),
             q_cov,
         }
     }
 
-    /// Reset the filter's internal state
-    pub fn reset(&mut self) {
-        self.u_hat = Vector3::new(1.0, 0.0, 0.0);
+    /// Reset the filter's internal state using some initial LOS vector
+    pub fn reset(&mut self, los: Vector3<f32>) {
+        self.los_hat = los;
+        self.basis = initial_basis(&los);
         self.omega_hat = Vector3::zeros();
         self.p_cov = SMatrix::identity();
     }
@@ -776,44 +481,46 @@ impl EskfLos {
     /// Predict the state forward in time (dead-reckoning).
     /// Call this at your system's base loop rate, regardless of whether a measurement arrived.
     pub fn predict(&mut self, dt: f32) {
-        // 1. Nominal State Propagation (Rodrigues' rotation formula)
+        // State Propagation (Rodrigues' rotation formula)
+        // https://en.wikipedia.org/wiki/Rodrigues'_rotation_formula
         let theta = self.omega_hat.norm() * dt;
         if theta > 1e-6 {
-            let k = self.omega_hat.normalize();
+            let u_dot_dir = self.omega_hat.normalize();
+            let k = self.los_hat.cross(&u_dot_dir).normalize();
             let k_skew = skew_symmetric(&k);
-            let r =
+            let rot =
                 Matrix3::identity() + k_skew * theta.sin() + k_skew * k_skew * (1.0 - theta.cos());
 
-            // Rotate the nominal LOS vector
-            self.u_hat = r * self.u_hat;
-
-            // Rotate the basis vectors to follow the LOS smoothly (Parallel Transport)
-            self.basis = r * self.basis;
+            // Rotate to follow the LOS smoothly
+            self.los_hat = rot * self.los_hat;
+            self.omega_hat = rot * self.omega_hat;
+            self.basis = rot * self.basis;
         }
 
-        // 2. Error Covariance Propagation
+        // Error Covariance Propagation
         let mut f = SMatrix::<f32, 4, 4>::identity();
         f[(0, 2)] = dt;
         f[(1, 3)] = dt;
 
-        self.p_cov = f * self.p_cov * f.transpose() + self.q_cov;
+        self.p_cov = f * self.p_cov * f.transpose() + self.q_cov * dt;
     }
 
     /// Update the filter with a new visual LOS measurement.
     /// `z_u`: The measured 3D unit vector, already rotated into the global inertial frame.
     /// `p_attitude`: The 3x3 covariance matrix from the host vehicle's attitude estimator.
     /// `r_pixel`: The baseline pixel measurement noise covariance (in global frame).
-    pub fn update(&mut self, z_u: Vector3<f32>, p_attitude: Matrix3<f32>, r_pixel: f32) {
+    pub fn update(&mut self, meas: &Measure) {
         // Measurement Jacobian H (3x4)
         let mut h = SMatrix::<f32, 3, 4>::zeros();
         h.fixed_columns_mut::<2>(0).copy_from(&self.basis);
 
         // Measurement Residual
-        let residual = z_u - self.u_hat;
+        let residual = meas.los_unit - self.los_hat;
 
         // Measurement Covariance R (incorporating host attitude uncertainty)
-        let z_skew = skew_symmetric(&z_u);
-        let r_cov = SMatrix::identity() * r_pixel + z_skew * p_attitude * z_skew.transpose();
+        let los_skew = skew_symmetric(&meas.los_unit);
+        let r_cov =
+            SMatrix::identity() * meas.r_pixel + los_skew * meas.p_attitude * los_skew.transpose();
 
         // Innovation Covariance S and Kalman Gain K
         let s = h * self.p_cov * h.transpose() + r_cov;
@@ -831,20 +538,20 @@ impl EskfLos {
             if theta_mag > 1e-6 {
                 let (theta_sin, theta_cos) = theta_mag.sin_cos();
                 let axis = (self.basis * d_theta) / theta_mag;
-                self.u_hat = (self.u_hat * theta_cos + axis * theta_sin).normalize();
+                self.los_hat = (self.los_hat * theta_cos + axis * theta_sin).normalize();
             }
 
             // Apply rate correction before refining the basis, and ensure manifold constraint
             self.omega_hat += self.basis * d_omega;
-            self.omega_hat -= self.u_hat * self.u_hat.dot(&self.omega_hat);
+            self.omega_hat -= self.los_hat * self.los_hat.dot(&self.omega_hat);
 
             // Update Covariance and Reset Error State (implicitly reset by not storing dx)
             self.p_cov = (SMatrix::identity() - k * h) * self.p_cov;
 
-            // Refine the Basis for the NEXT iteration
+            // Refine the tangent basis for the next iteration
             let b0 = self.basis.column(0);
-            let b1_new = (b0 - self.u_hat * self.u_hat.dot(&b0)).normalize();
-            let b2_new = self.u_hat.cross(&b1_new).normalize();
+            let b1_new = (b0 - self.los_hat * self.los_hat.dot(&b0)).normalize();
+            let b2_new = self.los_hat.cross(&b1_new).normalize();
             self.basis = SMatrix::<f32, 3, 2>::from_columns(&[b1_new, b2_new]);
         } else {
             log::error!("ESKF innovation covariance matrix is singular");
@@ -856,27 +563,18 @@ impl EskfLos {
 // OOSM wrapper for EskfLos
 // =============================================================================
 
-/// A measurement record stored in the input history.
 #[derive(Clone)]
-struct EskfInput {
+pub struct Timed<T> {
     timestamp: Instant,
-    /// `None` means a predict-only (coast) step; `Some` carries the fused measurement.
-    measurement: Option<EskfMeasurement>,
+    data: T,
 }
 
 /// All parameters needed to call `EskfLos::update`.
 #[derive(Clone)]
-struct EskfMeasurement {
-    z_u: Vector3<f32>,
+pub struct Measure {
+    los_unit: Vector3<f32>,
     p_attitude: Matrix3<f32>,
     r_pixel: f32,
-}
-
-/// A snapshot of the full `EskfLos` state at a specific time.
-#[derive(Clone)]
-struct EskfSnapshot {
-    timestamp: Instant,
-    filter: EskfLos,
 }
 
 /// Wraps `EskfLos` with out-of-sequence measurement (OOSM) support.
@@ -892,9 +590,9 @@ pub struct OosmEskfLos {
     /// Monotonically non-decreasing timestamp of the last committed step.
     current_time: Option<Instant>,
     /// Ring of post-step filter snapshots, oldest first.
-    snapshots: VecDeque<EskfSnapshot>,
+    filter_snapshot: VecDeque<Timed<EskfLos>>,
     /// Ring of all inputs (predict + update), kept in chronological order.
-    inputs: VecDeque<EskfInput>,
+    measurements: VecDeque<Timed<Measure>>,
     /// Maximum number of snapshots / inputs to retain.
     capacity: usize,
 }
@@ -908,8 +606,8 @@ impl OosmEskfLos {
         Self {
             filter,
             current_time: None,
-            snapshots: VecDeque::with_capacity(capacity),
-            inputs: VecDeque::with_capacity(capacity),
+            filter_snapshot: VecDeque::with_capacity(capacity),
+            measurements: VecDeque::with_capacity(capacity),
             capacity,
         }
     }
@@ -917,48 +615,38 @@ impl OosmEskfLos {
     // ── internal helpers ──────────────────────────────────────────────────────
 
     fn save_snapshot(&mut self, timestamp: Instant) {
-        if self.snapshots.len() == self.capacity {
-            self.snapshots.pop_front();
+        if self.filter_snapshot.len() == self.capacity {
+            self.filter_snapshot.pop_front();
         }
-        self.snapshots.push_back(EskfSnapshot {
+        self.filter_snapshot.push_back(Timed {
             timestamp,
-            filter: self.filter.clone(),
+            data: self.filter.clone(),
         });
     }
 
-    fn record_input(&mut self, input: EskfInput) {
-        if self.inputs.len() == self.capacity {
-            self.inputs.pop_front();
+    fn save_measurement_ordered(&mut self, input: Timed<Measure>) {
+        if self.measurements.len() == self.capacity {
+            self.measurements.pop_front();
         }
         // Insert in chronological order (binary search on timestamp).
         let pos = self
-            .inputs
+            .measurements
             .partition_point(|i| i.timestamp <= input.timestamp);
-        self.inputs.insert(pos, input);
+        self.measurements.insert(pos, input);
     }
 
-    fn restore_snapshot(&mut self, snap: &EskfSnapshot) {
-        self.filter = snap.filter.clone();
-        self.current_time = Some(snap.timestamp);
-    }
-
-    fn step_input(&mut self, input: &EskfInput) {
-        let dt = self
-            .current_time
-            .map(|t| {
-                if input.timestamp > t {
-                    (input.timestamp - t).as_micros() as f32 * 1e-6
-                } else {
-                    0.0
-                }
-            })
-            .unwrap_or(0.0);
+    fn measurement_update(&mut self, input: &Timed<Measure>) {
+        let dt = self.current_time.map_or(0.0, |t| {
+            if input.timestamp > t {
+                (input.timestamp - t).as_micros() as f32 * 1e-6
+            } else {
+                0.0
+            }
+        });
 
         self.filter.predict(dt);
 
-        if let Some(m) = &input.measurement {
-            self.filter.update(m.z_u, m.p_attitude, m.r_pixel);
-        }
+        self.filter.update(&input.data);
 
         self.current_time = Some(input.timestamp);
         self.save_snapshot(input.timestamp);
@@ -976,87 +664,59 @@ impl OosmEskfLos {
     pub fn fuse(
         &mut self,
         timestamp: Instant,
-        z_u: Vector3<f32>,
+        los_unit: Vector3<f32>,
         p_attitude: Matrix3<f32>,
         r_pixel: f32,
     ) {
-        let meas = Some(EskfMeasurement {
-            z_u,
-            p_attitude,
-            r_pixel,
-        });
+        let timed = Timed {
+            timestamp,
+            data: Measure {
+                los_unit,
+                p_attitude,
+                r_pixel,
+            },
+        };
 
-        let is_oosm = self.current_time.map_or(false, |t| timestamp < t);
-
-        if !is_oosm {
-            // ── In-order: simple forward step ──────────────────────────────
-            let input = EskfInput {
-                timestamp,
-                measurement: meas,
-            };
-            self.step_input(&input);
-            // record_input after step_input so the snapshot is already saved
-            self.record_input(input);
+        // Measurement is in sequence, fuse it normally
+        if self.current_time.map_or(true, |t| timestamp > t) {
+            self.measurement_update(&timed);
+            self.measurements.push_back(timed);
             return;
         }
 
-        // ── Out-of-sequence: rollback and replay ───────────────────────────
+        // Insert the new measurement in chronological order.
+        self.save_measurement_ordered(timed);
 
-        // 1. Insert the new measurement in chronological order.
-        self.record_input(EskfInput {
-            timestamp,
-            measurement: meas,
-        });
-
-        // 2. Find the latest snapshot strictly before the measurement time.
+        // Find the latest snapshot before the measurement time.
         let rollback_idx = self
-            .snapshots
+            .filter_snapshot
             .iter()
             .rposition(|s| s.timestamp < timestamp);
 
-        let replay_from = if let Some(idx) = rollback_idx {
-            let snap = self.snapshots[idx].clone();
-            let t = snap.timestamp;
-            self.restore_snapshot(&snap);
-            // Drop all snapshots after the rollback point; they'll be regenerated.
-            self.snapshots.truncate(idx + 1);
-            t
+        // Roll back to the filter snapshot before the new measurement
+        if let Some(idx) = rollback_idx {
+            let snap = self.filter_snapshot[idx].clone();
+
+            self.filter = snap.data;
+            self.current_time = Some(snap.timestamp);
+            self.filter_snapshot.truncate(idx + 1);
+
+            // 3. Collect and replay every input strictly after the rollback point.
+            //    We clone indices to avoid borrowing `self` while mutating it.
+            let to_replay: Vec<Timed<Measure>> = self
+                .measurements
+                .iter()
+                .filter(|i| i.timestamp > snap.timestamp)
+                .cloned()
+                .collect();
+
+            for input in &to_replay {
+                self.measurement_update(input);
+            }
         } else {
-            // No old-enough snapshot — reset and replay from the very beginning.
-            self.filter.reset();
-            self.current_time = None;
-            self.snapshots.clear();
-            self.inputs
-                .front()
-                .map(|i| i.timestamp)
-                .unwrap_or(timestamp)
-        };
-
-        // 3. Collect and replay every input strictly after the rollback point.
-        //    We clone indices to avoid borrowing `self` while mutating it.
-        let to_replay: Vec<EskfInput> = self
-            .inputs
-            .iter()
-            .filter(|i| i.timestamp > replay_from)
-            .cloned()
-            .collect();
-
-        for input in &to_replay {
-            self.step_input(input);
+            log::warn!("Measurement too old for OOSM, discarding.");
+            return;
         }
-    }
-
-    /// Advance the filter to `now` without a measurement (coast / dead-reckoning).
-    ///
-    /// This *is* recorded in the input history so that OOSM replays stay
-    /// consistent with the predict steps that the controller has already seen.
-    pub fn predict_step(&mut self, now: Instant) {
-        let input = EskfInput {
-            timestamp: now,
-            measurement: None,
-        };
-        self.step_input(&input);
-        self.record_input(input);
     }
 
     /// Extrapolate the current filter state to `now` without modifying history.
@@ -1064,29 +724,26 @@ impl OosmEskfLos {
     /// Use this from the controller tick to get the best current estimate
     /// without committing a coast step that would pollute future replays.
     pub fn predict_to(&self, now: Instant) -> (Vector3<f32>, Vector3<f32>) {
-        let dt = self
-            .current_time
-            .map(|t| {
-                if now > t {
-                    (now - t).as_micros() as f32 * 1e-6
-                } else {
-                    0.0
-                }
-            })
-            .unwrap_or(0.0);
+        let dt = self.current_time.map_or(0.0, |t| {
+            if now > t {
+                (now - t).as_micros() as f32 * 1e-6
+            } else {
+                0.0
+            }
+        });
 
         if dt < 1e-9 {
-            return (self.filter.u_hat, self.filter.omega_hat);
+            return self.current_estimate();
         }
 
         // Clone and step — no side effects on `self`.
         let mut tmp = self.filter.clone();
         tmp.predict(dt);
-        (tmp.u_hat, tmp.omega_hat)
+        (tmp.los_hat, tmp.omega_hat)
     }
 
     /// The current committed estimate (at `current_time`, not extrapolated).
     pub fn current_estimate(&self) -> (Vector3<f32>, Vector3<f32>) {
-        (self.filter.u_hat, self.filter.omega_hat)
+        (self.filter.los_hat, self.filter.omega_hat)
     }
 }

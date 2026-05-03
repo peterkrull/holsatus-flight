@@ -1,8 +1,9 @@
 use std::time::Instant;
 
-use nalgebra::{Isometry, Point3, UnitQuaternion, Vector3};
 use crate::motor_lin::MotorLin;
+use nalgebra::{Isometry, Point3, UnitQuaternion, Vector3};
 
+use rand::Rng;
 use rapier3d::prelude::*;
 
 /// Configuration for single motor.
@@ -91,6 +92,7 @@ pub struct Simulation {
     pub(crate) start_time: Instant,
     pub(crate) state: VehicleState,
     pub(crate) params: VehicleParams,
+    pub(crate) wind_velocity: Vector3<f32>,
     rb_handle: RigidBodyHandle,
     phys: RapierPhys,
 }
@@ -109,7 +111,6 @@ struct RapierPhys {
     multibody_joints: MultibodyJointSet,
     ccd_solver: CCDSolver,
 }
-
 
 impl RapierPhys {
     // Rigidbody handle
@@ -183,6 +184,7 @@ impl Simulation {
         Simulation {
             start_time: Instant::now(),
             params: vehicle,
+            wind_velocity: Vector3::zeros(),
             rb_handle,
             state: VehicleState {
                 rotation: UnitQuaternion::default(),
@@ -190,17 +192,20 @@ impl Simulation {
                 velocity: Vector3::zeros(),
                 body_acc: Vector3::zeros(),
                 body_gyr: Vector3::zeros(),
-                motors: vec![MotorState {
-                    force: 0.0,
-                    command: 0.0,
-                    direction: false,
-                }; num_motors],
+                motors: vec![
+                    MotorState {
+                        force: 0.0,
+                        command: 0.0,
+                        direction: false,
+                    };
+                    num_motors
+                ],
             },
             phys: RapierPhys {
                 bodies,
                 colliders,
                 gravity: vector![0.0, 0.0, 9.81],
-                .. RapierPhys::default()
+                ..RapierPhys::default()
             },
         }
     }
@@ -242,7 +247,6 @@ impl Simulation {
     /// Update the simulation by applying the inputs and
     /// move the simulation forward a single time step.
     pub fn update(&mut self, dt: f32) {
-
         // Apply first-order filtering to input motor signals and
         // calculate per motor body-force and -torque contributions.
         let mut body_force = Vector3::zeros();
@@ -265,16 +269,50 @@ impl Simulation {
         let world_force = rb.rotation() * body_force;
         let world_torque = rb.rotation() * body_torque;
 
+        // 1. Emulate changing winds (Random Walk)
+        // Standard deviation of wind change per second (e.g., 0.5 m/s^2)
+        let wind_volatility = 5.0;
+        let mut rng = rand::rng();
+        let normal = rand_distr::Normal::new(0.0, wind_volatility * dt).unwrap();
+
+        self.wind_velocity.x += rng.sample(&normal);
+        self.wind_velocity.y += rng.sample(&normal);
+        self.wind_velocity.z += rng.sample(&normal) * 0.2;
+
+        // Optional: bound the wind speed so it doesn't walk to infinity
+        let max_wind = 30.0;
+        if self.wind_velocity.norm() > max_wind {
+            self.wind_velocity = self.wind_velocity.normalize() * max_wind;
+        }
+
+        // Reduce wind closer to ground
+        let mut out_wind = self.wind_velocity;
+        if rb.position().translation.z.abs() < 20.0 {
+            out_wind *= rb.position().translation.z.abs() / 20.0;
+        }
+
+        // 2. Calculate Air Relative Velocity
+        let drone_velocity = rb.linvel().clone();
+        let air_velocity = drone_velocity - out_wind;
+
+        // 3. Calculate Aerodynamic Drag Force manually
+        // Formula: F_drag = - damping_coefficient * |V_air| * V_air
+        let drag_magnitude = self.params.lin_damp * air_velocity.norm();
+        let drag_force = -air_velocity * drag_magnitude;
+
         // Apply forces and torques to rigid body
         rb.reset_forces(true);
         rb.reset_torques(true);
-        rb.add_force(world_force, true);
+        rb.add_force(world_force + drag_force, true); // Add drag to world force
         rb.add_torque(world_torque, true);
 
-        // Calculate quadratic damping
-        let velocity_norm = rb.linvel().norm();
-        let dynamic_damping = self.params.lin_damp * velocity_norm;
-        rb.set_linear_damping(dynamic_damping);
+        // REMOVE this old Rapier damping code:
+        // let velocity_norm = rb.linvel().norm();
+        // let dynamic_damping = self.params.lin_damp * velocity_norm;
+        // rb.set_linear_damping(dynamic_damping);
+
+        // Disable rapier's internal damping entirely
+        rb.set_linear_damping(0.0);
 
         // Get velocity prior to simulation step
         let rb = self.phys.get_rb_ref(self.rb_handle);

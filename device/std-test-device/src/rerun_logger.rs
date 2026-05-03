@@ -5,6 +5,8 @@ use embassy_time::Instant;
 use holsatus_sim::{Sim, SimHandle};
 use rerun::{Arrows3D, Color, LineStrips3D, Points3D, Position3D, RecordingStream, Scalars, Vec3D};
 
+use crate::CAM_TRANS;
+
 pub fn setup(
     handle: SimHandle,
     subsample: usize,
@@ -63,7 +65,7 @@ impl RerunLogger {
             nalgebra::UnitQuaternion::from_euler_angles(PI / 2.0 + camera_pitch, 0.0, PI / 2.0);
         rec.log(
             "drone/camera",
-            &rerun::Transform3D::from_translation([0.1, 0.0, 0.0])
+            &rerun::Transform3D::from_translation(CAM_TRANS.data.0[0])
                 .with_quaternion(cam_rot.coords.data.0[0]),
         )?;
 
@@ -146,6 +148,13 @@ impl RerunLogger {
             self.rec.log(
                 "sim/firmware/los_rate_scalar",
                 &Scalars::new([los_rate[0], los_rate[1], los_rate[2]]),
+            )?;
+
+            self.rec.log(
+                "sim/firmware/los_rate_scalar_norm",
+                &Scalars::new([
+                    (los_rate[0].powi(2) + los_rate[1].powi(2) + los_rate[2].powi(2)).sqrt(),
+                ]),
             )?;
         }
 
@@ -299,7 +308,7 @@ impl RerunLogger {
 
         if let Some((target_pos, _)) = crate::TARGET_POSE.try_get() {
             // Determine the world-position of the drone-cameras focal point (0.1 in front of center)
-            let focal_point = pos + rot.transform_vector(&[0.1, 0.0, 0.0].into());
+            let focal_point = pos + rot.transform_vector(&CAM_TRANS);
             let line_of_sight = rerun::LineStrip3D::from_iter([target_pos, focal_point.data.0[0]]);
 
             self.rec

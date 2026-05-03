@@ -6,9 +6,8 @@ use std::sync::{
 use clap::Parser;
 use common::{
     embassy_futures::select::{select, Either},
-    nalgebra::{Point2, UnitQuaternion, Vector3},
+    nalgebra::{Matrix3, Point2, SMatrix, UnitQuaternion, Vector3},
     sync::{channel::Channel, watch::Watch},
-    tasks::eskf::EskfEstimate,
 };
 use embassy_executor::{SendSpawner, Spawner};
 use embassy_time::{Duration, Instant, Ticker, Timer};
@@ -174,22 +173,23 @@ async fn flight_test_task() {
     let mut pronav = pronav::ProNav::new(0.64)
         .pronav_gain(3.0)
         .intnav_gain(1.0)
-        .pursuit_gain(6.0)
-        .velocity_gain(2.0)
+        .pursuit_gain(1.0)
+        .velocity_gain(1.0)
         .velocity_target(30.0)
         .camera_pitch(CAMERA.pitch_rad)
-        .fov_limit(10.0_f32.to_radians())
-        .fov_penalty_gain(5.0);
+        .fov_limit(CAMERA.vfov_rad / 3.0)
+        .fov_penalty_gain(10.0);
 
-    let mut ab_filter = pronav::AlphaBetaLos::new(0.05); // Increased bandwidth to eliminate lag when target/drone move
+    let q_cov = SMatrix::from_diagonal(&[1e-4, 1e-4, 1e-2, 1e-2].into());
+    let filter = pronav::EskfLos::new(q_cov);
+    let mut eskf_filter = pronav::OosmEskfLos::new(filter, 100);
+
     let mut att_buffer = pronav::AttitudeBuffer::new(100); // ~2 seconds at 100 Hz
 
     let delta = Duration::from_hz(100);
     let dt = delta.as_micros() as f32 * 1e-6;
 
     let mut ticker = Ticker::every(delta);
-
-    let mut los_rate_lp = Vector3::zeros();
 
     loop {
         match select(EVENTS.receive(), ticker.next()).await {
@@ -200,9 +200,12 @@ async fn flight_test_task() {
                         target_pixel,
                     } => {
                         // Look up attitude at the camera's *capture* timestamp
-                        if let Some((att_at_capture, _)) = att_buffer.interpolate_at(timestamp) {
-                            let measured_los = CAMERA.pixel_to_global(target_pixel, att_at_capture);
-                            ab_filter.fuse(timestamp, Some(measured_los));
+                        if let Some(att_at_capture) = att_buffer.interpolate_at(timestamp) {
+                            let body_los = CAMERA.pixel_to_los_body(target_pixel);
+                            let global_los = att_at_capture.transform_vector(&body_los);
+                            let p_attitude = SMatrix::identity() * 1e-4;
+                            let r_pixel = 1e-3; // Variance for 5 pixel std dev
+                            eskf_filter.fuse(timestamp, global_los, p_attitude, r_pixel);
                         } else {
                             log::error!(
                                 "Failed to interpolate attitude at {} us (buffer size: {})",
@@ -218,33 +221,28 @@ async fn flight_test_task() {
                     } => {
                         att_buffer.push(timestamp, attitude, angular_vel);
                     }
-                    Event::Quit => break,
                 }
             }
             Either::Second(()) => {
                 let now = Instant::now();
 
                 // Get filter estimate extrapolated to the current time
-                let (los_unit, los_rate) = ab_filter.predict_to(now);
-
-                los_rate_lp = los_rate * 0.1 + los_rate_lp * 0.90;
+                let (los_unit, los_rate) = eskf_filter.predict_to(now);
 
                 let estimate = rcv_eskf_estimate.get().await;
 
                 // Visualize the image LOS observation
-                let los_vector_local = estimate.att.inverse().transform_vector(&los_unit)
-                    + Vector3::new(0.1, 0.0, 0.0);
+                let los_vector_local = estimate.att.inverse_transform_vector(&los_unit) + CAM_TRANS;
 
-                LOS_VECTOR.send((los_vector_local.into(), los_rate_lp.into()));
+                LOS_VECTOR.send((los_vector_local.into(), los_rate.into()));
 
                 // Get latest attitude for the controller
                 let attitude = att_buffer
                     .interpolate_at(now)
-                    .map(|(att, _)| att)
-                    .unwrap_or_else(|| UnitQuaternion::identity());
+                    .unwrap_or_else(UnitQuaternion::identity);
 
-                let closing_vel = 30.0; // Assume we have an air speed sensor
-                let (att, force) = pronav.update(closing_vel, los_unit, los_rate_lp, attitude, dt);
+                let closing_vel = estimate.vel.norm(); // Assume we have an air speed sensor
+                let (att, force) = pronav.update(closing_vel, los_unit, los_rate, attitude, dt);
 
                 // Ensure we have attitude authority
                 let force = force.min(25.0);
@@ -254,36 +252,17 @@ async fn flight_test_task() {
             }
         }
     }
-
-    RUNNING.store(false, Ordering::Relaxed);
-
-    // Start LOS-rate control
-    log::warn!("Sending disarm command");
-    PROCEDURE
-        .send(Request {
-            command: Command::ArmDisarm {
-                arm: false,
-                force: true,
-            }
-            .into(),
-            origin: Origin::Automatic,
-        })
-        .await;
-
-    Timer::after_secs(5).await;
-
-    RUNNING.store(false, Ordering::Relaxed);
 }
 
+pub const CAM_TRANS: Vector3<f32> = Vector3::new(0.1, 0.0, 0.0);
 pub static LOS_VECTOR: Watch<([f32; 3], [f32; 3])> = Watch::new();
 pub static TARGET_POSE: Watch<([f32; 3], [f32; 3])> = Watch::new();
 
 const CAMERA: LazyLock<pronav::CameraModel> = LazyLock::new(|| {
-    pronav::CameraModel::new(1440.0, 1080.0, 60.0_f32.to_radians(), 10.0_f32.to_radians())
+    pronav::CameraModel::new(1440.0, 1080.0, 70.0_f32.to_radians(), 25.0_f32.to_radians())
 });
 
 pub enum Event {
-    Quit,
     Camera {
         timestamp: Instant,
         target_pixel: Point2<f32>,
@@ -307,69 +286,70 @@ async fn camera_task() {
     let delta = Duration::from_hz(50);
     let dt = delta.as_micros() as f32 * 1e-6;
 
-    let pos_gen = |index| {
-        const SLOWDOWN: u32 = 1800;
-        if index < SLOWDOWN {
-            let x = 800.0;
-            let y = 500.0 - dt * index as f32 * 25.0;
-            Vector3::new(x, y, 0.0)
-        } else {
-            let x = 800.0 - dt * (index - SLOWDOWN) as f32 * 15.0;
-            let y = 500.0 - dt * (SLOWDOWN as f32) * 25.0 + dt * (index - SLOWDOWN) as f32 * 10.0;
-            Vector3::new(x, y, 0.0)
-        }
-    };
+    let trajectory = Trajectory::new(vec![
+        Waypoint {
+            time: 0.0,
+            pos: Vector3::new(1000.0, 0.0, 0.0),
+        },
+        Waypoint {
+            time: 10.0,
+            pos: Vector3::new(600.0, 0.0, 0.0),
+        },
+        Waypoint {
+            time: 10.0,
+            pos: Vector3::new(400.0, -100.0, 0.0),
+        },
+        Waypoint {
+            time: 8.0,
+            pos: Vector3::new(200.0, 100.0, 0.0),
+        },
+        Waypoint {
+            time: 20.0,
+            pos: Vector3::new(100.0, 200.0, 0.0),
+        },
+    ]);
 
-    let pixel_disr = Normal::new(0.0, 5.0).unwrap();
+    let pixel_disr = Normal::new(0.0, 1.0).unwrap();
     let mut rng = rand::rng();
 
-    let mut index = 0;
-    let mut break_index = u32::MAX;
+    let mut elapsed_time = 0.0;
+    let mut break_time = f32::MAX;
     let mut ticker = Ticker::every(delta);
+    let mut prev_target_pos = trajectory.smoothed_position_at(0.0, 1.0);
     loop {
         ticker.next().await;
 
-        let estimate = rcv_eskf_estimate.get().await;
-
-        let mut target_pos = pos_gen(index);
-        let target_vel = (target_pos - pos_gen(index - 1)) * dt.recip();
+        // Exact target position and velocity
+        let target_pos = trajectory.smoothed_position_at(elapsed_time, 1.0);
+        let target_vel = (target_pos - prev_target_pos) / dt;
+        prev_target_pos = target_pos;
 
         // Publish so visualization can show target
         TARGET_POSE.send((target_pos.into(), target_vel.into()));
 
         // Raise target pos artificially for better centering
-        target_pos[2] -= 2.0;
+        let target_pos = target_pos - Vector3::z() * 2.0;
 
-        if (estimate.pos - target_pos).norm() < 2.0 && break_index == u32::MAX {
-            log::info!("Target struck!");
-            break_index = index + 10;
-        }
-
-        if index > break_index {
-            EVENTS.send(Event::Quit).await;
-            break;
-        }
-
-        // 1. Vision emulation: Get target in global space, find its pixel
-        let focal_point = estimate.pos + estimate.att.transform_vector(&[0.1, 0.0, 0.0].into());
-        if let Some(exact_pixel) = CAMERA.project_to_pixel(target_pos - focal_point, estimate.att) {
+        // Determine pixel which corresponds to the target in the viewport
+        let estimate = rcv_eskf_estimate.get().await;
+        let focal_point = estimate.pos + estimate.att.transform_vector(&CAM_TRANS);
+        let los_global = target_pos - focal_point;
+        let los_body = estimate.att.inverse_transform_vector(&los_global);
+        if let Some(exact_pixel) = CAMERA.project_to_pixel(los_body) {
             let noisy_pixel = Point2::new(
-                exact_pixel.0 + pixel_disr.sample(&mut rng),
-                exact_pixel.1 + pixel_disr.sample(&mut rng),
+                exact_pixel.x + pixel_disr.sample(&mut rng),
+                exact_pixel.y + pixel_disr.sample(&mut rng),
             );
 
-            // Visualize the image LOS observation
-            let los_vector_meas = CAMERA.pixel_to_global(noisy_pixel, estimate.att);
-            let los_vector_local = estimate.att.inverse().transform_vector(&los_vector_meas)
-                + Vector3::new(0.1, 0.0, 0.0);
-            LOS_VECTOR_LOCAL.send(los_vector_local);
+            // Visualize the noisy image LOS observation
+            LOS_VECTOR_LOCAL.send(CAMERA.pixel_to_los_body(noisy_pixel) + CAM_TRANS);
 
             let event = Event::Camera {
                 timestamp: Instant::now(),
                 target_pixel: noisy_pixel,
             };
 
-            let sleep_dur = Duration::from_micros(250_000 + rng.next_u64() % 10_000);
+            let sleep_dur = Duration::from_micros(50_000 + rng.next_u64() % 10_000);
             if let Ok(task_handle) = delayed_event_task(event, sleep_dur) {
                 let spawner = SendSpawner::for_current_executor().await;
                 spawner.spawn(task_handle);
@@ -378,7 +358,16 @@ async fn camera_task() {
             }
         }
 
-        index += 1;
+        if los_global.norm() < 2.0 && break_time == f32::MAX {
+            log::info!("Target struck!");
+            break_time = elapsed_time + 0.1;
+        }
+
+        if elapsed_time > break_time {
+            RUNNING.store(false, Ordering::Relaxed)
+        }
+
+        elapsed_time += dt;
     }
 }
 
@@ -407,7 +396,7 @@ async fn attitude_task() {
             angular_vel: estimate.ang_vel.into(),
         };
 
-        let sleep_dur = Duration::from_micros(50_000 + rng.next_u64() % 5_000);
+        let sleep_dur = Duration::from_micros(10_000 + rng.next_u64() % 5_000);
         if let Ok(task_handle) = delayed_event_task(event, sleep_dur) {
             let spawner = SendSpawner::for_current_executor().await;
             spawner.spawn(task_handle);
@@ -417,8 +406,89 @@ async fn attitude_task() {
     }
 }
 
-#[embassy_executor::task(pool_size = 100)]
+#[embassy_executor::task(pool_size = 1000)]
 async fn delayed_event_task(event: Event, duration: Duration) {
     Timer::after(duration).await;
     EVENTS.send(event).await;
+}
+
+#[derive(Clone, Debug)]
+pub struct Waypoint {
+    pub time: f32,
+    pub pos: Vector3<f32>,
+}
+
+pub struct Trajectory {
+    waypoints: Vec<Waypoint>,
+}
+
+impl Trajectory {
+    /// Creates a new trajectory. Waypoints should ideally be ordered by time.
+    pub fn new(mut waypoints: Vec<Waypoint>) -> Self {
+        // Ensure waypoints are strictly sorted by time to allow safe interpolation
+        let mut time_accum = 0.0;
+        for waypoint in waypoints.iter_mut() {
+            time_accum += waypoint.time;
+            waypoint.time = time_accum;
+        }
+        Self { waypoints }
+    }
+
+    /// Evaluates the target position at a given time `t` (in seconds).
+    pub fn position_at(&self, t: f32) -> Vector3<f32> {
+        if self.waypoints.is_empty() {
+            return Vector3::zeros();
+        }
+
+        // Clamp to the first waypoint if 't' is before the start
+        if t <= self.waypoints.first().unwrap().time {
+            return self.waypoints.first().unwrap().pos;
+        }
+
+        // Clamp to the last waypoint if 't' is after the end
+        if t >= self.waypoints.last().unwrap().time {
+            return self.waypoints.last().unwrap().pos;
+        }
+
+        // Find the segment that contains time 't' and interpolate
+        for window in self.waypoints.windows(2) {
+            let wp1 = &window[0];
+            let wp2 = &window[1];
+
+            if t >= wp1.time && t <= wp2.time {
+                // Calculate how far along the segment we are (0.0 to 1.0)
+                let progress = (t - wp1.time) / (wp2.time - wp1.time);
+
+                // Linear interpolation (Lerp)
+                return wp1.pos + (wp2.pos - wp1.pos) * progress;
+            }
+        }
+
+        // Fallback (should be unreachable due to boundary checks above)
+        self.waypoints.last().unwrap().pos
+    }
+
+    /// Evaluates a smoothed target position by applying a moving average
+    /// over the window [t - window, t + window].
+    /// A window of 1.0 means it averages over a 2-second spread.
+    pub fn smoothed_position_at(&self, t: f32, window: f32) -> Vector3<f32> {
+        if window <= 0.001 {
+            return self.position_at(t);
+        }
+
+        // 20 samples is plenty for a very smooth interpolation
+        const SAMPLES: usize = 20;
+        let mut sum = Vector3::zeros();
+
+        let start_t = t - window;
+        let end_t = t + window;
+        let step = (end_t - start_t) / (SAMPLES as f32 - 1.0);
+
+        for i in 0..SAMPLES {
+            let sample_t = start_t + (i as f32) * step;
+            sum += self.position_at(sample_t);
+        }
+
+        sum / (SAMPLES as f32)
+    }
 }
