@@ -5,9 +5,12 @@ use std::sync::{
 
 use clap::Parser;
 use common::{
-    embassy_futures::select::{Either, select}, nalgebra::{Point2, UnitQuaternion, Vector3}, sync::{channel::Channel, watch::Watch}, tasks::eskf::EskfEstimate
+    embassy_futures::select::{select, Either},
+    nalgebra::{Point2, UnitQuaternion, Vector3},
+    sync::{channel::Channel, watch::Watch},
+    tasks::eskf::EskfEstimate,
 };
-use embassy_executor::Spawner;
+use embassy_executor::{SendSpawner, Spawner};
 use embassy_time::{Duration, Instant, Ticker, Timer};
 use holsatus_sim::{Resources, Sim, SimHandle};
 use rand::Rng;
@@ -30,6 +33,7 @@ pub static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
 });
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
+static PRONAV_READY: Watch<bool> = Watch::new();
 
 #[derive(clap::Parser)]
 pub struct Args {
@@ -113,6 +117,8 @@ fn firmware_entry(spawner: Spawner, r: Resources, sim: SimHandle) {
     spawner.spawn(common::tasks::controller_mpc::main().unwrap());
 
     spawner.spawn(flight_test_task().unwrap());
+    spawner.spawn(camera_task().unwrap());
+    spawner.spawn(attitude_task().unwrap());
     spawner.spawn(simulated_vicon(sim).unwrap());
 }
 
@@ -146,6 +152,7 @@ async fn flight_test_task() {
     log::debug!("============= Starting flight test =============");
     log::debug!("================================================");
 
+    let mut rcv_eskf_estimate = common::signals::ESKF_ESTIMATE.receiver();
     let mut rcv_motors_state = common::signals::MOTORS_STATE.receiver();
     let mut snd_attitude_sp = common::signals::TRUE_ATTITUDE_Q_SP.sender();
     let mut snd_z_thrust_sp = common::signals::TRUE_Z_THRUST_SP.sender();
@@ -155,63 +162,89 @@ async fn flight_test_task() {
 
     for _ in 0..350 {
         snd_attitude_sp.send(UnitQuaternion::from_euler_angles(0.0, 0.0, 0.0));
-        snd_z_thrust_sp.send(20.0);
-        Timer::after_millis(10).await;
+        snd_z_thrust_sp.send(25.0);
+        Timer::after_millis(20).await;
     }
-
-    for _ in 0..300 {
-        snd_attitude_sp.send(UnitQuaternion::from_euler_angles(0.0, 0.0, 0.0));
-        snd_z_thrust_sp.send(4.0);
-        Timer::after_millis(10).await;
-    }
-
-    snd_attitude_sp.send(UnitQuaternion::from_euler_angles(0.0, -0.4, 0.0));
-    Timer::after_millis(1000).await;
 
     log::info!("Starting ProNav");
 
+    // Signal producer tasks that the consumer loop is ready
+    PRONAV_READY.send(true);
+
     let mut pronav = pronav::ProNav::new(0.64)
-        .pronav_gain(4.0)
+        .pronav_gain(3.0)
         .intnav_gain(1.0)
-        .pursuit_gain(1.0)
+        .pursuit_gain(6.0)
         .velocity_gain(2.0)
         .velocity_target(30.0)
-        .camera_pitch(35.0_f32.to_radians())
-        .fov_limit(40.0_f32.to_radians())
+        .camera_pitch(CAMERA.pitch_rad)
+        .fov_limit(10.0_f32.to_radians())
         .fov_penalty_gain(5.0);
 
-    let mut ab_filter = pronav::AlphaBetaLos::new(0.05); // Tuned down to suppress quantization noise from camera resolution
+    let mut ab_filter = pronav::AlphaBetaLos::new(0.05); // Increased bandwidth to eliminate lag when target/drone move
+    let mut att_buffer = pronav::AttitudeBuffer::new(100); // ~2 seconds at 100 Hz
 
     let delta = Duration::from_hz(100);
     let dt = delta.as_micros() as f32 * 1e-6;
 
     let mut ticker = Ticker::every(delta);
 
-    loop {
+    let mut los_rate_lp = Vector3::zeros();
 
+    loop {
         match select(EVENTS.receive(), ticker.next()).await {
             Either::First(event) => {
-                match EVENTS.receive().await {
+                match event {
                     Event::Camera {
                         timestamp,
                         target_pixel,
                     } => {
-                        let attitude = ; // Interpolate / estimate attitude at timestamp
-                        let measured_los = CAMERA.pixel_to_global(target_pixel, attitude);
-                        let (los_unit, los_rate) = ab_filter.update(Some(measured_los), dt);
+                        // Look up attitude at the camera's *capture* timestamp
+                        if let Some((att_at_capture, _)) = att_buffer.interpolate_at(timestamp) {
+                            let measured_los = CAMERA.pixel_to_global(target_pixel, att_at_capture);
+                            ab_filter.fuse(timestamp, Some(measured_los));
+                        } else {
+                            log::error!(
+                                "Failed to interpolate attitude at {} us (buffer size: {})",
+                                timestamp.as_micros(),
+                                att_buffer.entries.len()
+                            );
+                        }
                     }
                     Event::Attitude {
                         timestamp,
                         attitude,
                         angular_vel,
-                    } => {}
+                    } => {
+                        att_buffer.push(timestamp, attitude, angular_vel);
+                    }
                     Event::Quit => break,
                 }
             }
             Either::Second(()) => {
+                let now = Instant::now();
+
+                // Get filter estimate extrapolated to the current time
+                let (los_unit, los_rate) = ab_filter.predict_to(now);
+
+                los_rate_lp = los_rate * 0.1 + los_rate_lp * 0.90;
+
+                let estimate = rcv_eskf_estimate.get().await;
+
+                // Visualize the image LOS observation
+                let los_vector_local = estimate.att.inverse().transform_vector(&los_unit)
+                    + Vector3::new(0.1, 0.0, 0.0);
+
+                LOS_VECTOR.send((los_vector_local.into(), los_rate_lp.into()));
+
+                // Get latest attitude for the controller
+                let attitude = att_buffer
+                    .interpolate_at(now)
+                    .map(|(att, _)| att)
+                    .unwrap_or_else(|| UnitQuaternion::identity());
+
                 let closing_vel = 30.0; // Assume we have an air speed sensor
-                let attitude = ; // Interpolate / estimate attitude at timestamp
-                let (att, force) = pronav.update(closing_vel, los_unit, los_rate, attitude, dt);
+                let (att, force) = pronav.update(closing_vel, los_unit, los_rate_lp, attitude, dt);
 
                 // Ensure we have attitude authority
                 let force = force.min(25.0);
@@ -242,8 +275,11 @@ async fn flight_test_task() {
     RUNNING.store(false, Ordering::Relaxed);
 }
 
+pub static LOS_VECTOR: Watch<([f32; 3], [f32; 3])> = Watch::new();
+pub static TARGET_POSE: Watch<([f32; 3], [f32; 3])> = Watch::new();
+
 const CAMERA: LazyLock<pronav::CameraModel> = LazyLock::new(|| {
-    pronav::CameraModel::new(1440.0, 1080.0, 90.0_f32.to_radians(), 35.0_f32.to_radians())
+    pronav::CameraModel::new(1440.0, 1080.0, 60.0_f32.to_radians(), 10.0_f32.to_radians())
 });
 
 pub enum Event {
@@ -263,21 +299,32 @@ static EVENTS: Channel<Event, 2> = Channel::new();
 
 #[embassy_executor::task]
 async fn camera_task() {
+    // Wait until the ProNav loop is ready to consume events
+    PRONAV_READY.receiver().get().await;
+
     let mut rcv_eskf_estimate = common::signals::ESKF_ESTIMATE.receiver();
 
     let delta = Duration::from_hz(50);
     let dt = delta.as_micros() as f32 * 1e-6;
 
     let pos_gen = |index| {
-        let x = 600.0 - dt * index as f32 * 20.0;
-        let y = 100.0 - dt * index as f32 * 20.0;
-        Vector3::new(x, y, 0.0)
+        const SLOWDOWN: u32 = 1800;
+        if index < SLOWDOWN {
+            let x = 800.0;
+            let y = 500.0 - dt * index as f32 * 25.0;
+            Vector3::new(x, y, 0.0)
+        } else {
+            let x = 800.0 - dt * (index - SLOWDOWN) as f32 * 15.0;
+            let y = 500.0 - dt * (SLOWDOWN as f32) * 25.0 + dt * (index - SLOWDOWN) as f32 * 10.0;
+            Vector3::new(x, y, 0.0)
+        }
     };
 
-    let pixel_disr = Normal::new(0.0, 2.0).unwrap();
+    let pixel_disr = Normal::new(0.0, 5.0).unwrap();
     let mut rng = rand::rng();
 
     let mut index = 0;
+    let mut break_index = u32::MAX;
     let mut ticker = Ticker::every(delta);
     loop {
         ticker.next().await;
@@ -293,8 +340,12 @@ async fn camera_task() {
         // Raise target pos artificially for better centering
         target_pos[2] -= 2.0;
 
-        if (estimate.pos - target_pos).norm() < 2.0 {
+        if (estimate.pos - target_pos).norm() < 2.0 && break_index == u32::MAX {
             log::info!("Target struck!");
+            break_index = index + 10;
+        }
+
+        if index > break_index {
             EVENTS.send(Event::Quit).await;
             break;
         }
@@ -307,23 +358,37 @@ async fn camera_task() {
                 exact_pixel.1 + pixel_disr.sample(&mut rng),
             );
 
+            // Visualize the image LOS observation
+            let los_vector_meas = CAMERA.pixel_to_global(noisy_pixel, estimate.att);
+            let los_vector_local = estimate.att.inverse().transform_vector(&los_vector_meas)
+                + Vector3::new(0.1, 0.0, 0.0);
+            LOS_VECTOR_LOCAL.send(los_vector_local);
+
             let event = Event::Camera {
                 timestamp: Instant::now(),
                 target_pixel: noisy_pixel,
             };
 
-            // Add time delay and random jitter: 30 + 0..10 ms
-            Timer::after_micros(30_000 + rng.next_u64() % 10_000).await;
-
-            EVENTS.send(event).await;
+            let sleep_dur = Duration::from_micros(250_000 + rng.next_u64() % 10_000);
+            if let Ok(task_handle) = delayed_event_task(event, sleep_dur) {
+                let spawner = SendSpawner::for_current_executor().await;
+                spawner.spawn(task_handle);
+            } else {
+                log::error!("Failed to spawn delayed_event_task");
+            }
         }
 
         index += 1;
     }
 }
 
+static LOS_VECTOR_LOCAL: Watch<Vector3<f32>> = Watch::new();
+
 #[embassy_executor::task]
 async fn attitude_task() {
+    // Wait until the ProNav loop is ready to consume events
+    PRONAV_READY.receiver().get().await;
+
     let mut rcv_eskf_estimate = common::signals::ESKF_ESTIMATE.receiver();
 
     let mut rng = rand::rng();
@@ -342,11 +407,18 @@ async fn attitude_task() {
             angular_vel: estimate.ang_vel.into(),
         };
 
-        // Add time delay and random jitter: 10 + 0..2 ms
-        Timer::after_micros(10_000 + rng.next_u64() % 2_000).await;
-
-        EVENTS.send(event).await;
+        let sleep_dur = Duration::from_micros(50_000 + rng.next_u64() % 5_000);
+        if let Ok(task_handle) = delayed_event_task(event, sleep_dur) {
+            let spawner = SendSpawner::for_current_executor().await;
+            spawner.spawn(task_handle);
+        } else {
+            log::error!("Failed to spawn delayed_event_task");
+        }
     }
 }
 
-pub static TARGET_POSE: Watch<([f32; 3], [f32; 3])> = Watch::new();
+#[embassy_executor::task(pool_size = 100)]
+async fn delayed_event_task(event: Event, duration: Duration) {
+    Timer::after(duration).await;
+    EVENTS.send(event).await;
+}

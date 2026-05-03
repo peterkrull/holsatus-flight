@@ -3,7 +3,7 @@ use std::{collections::VecDeque, f32::consts::PI};
 use common::nalgebra::{self, UnitQuaternion};
 use embassy_time::Instant;
 use holsatus_sim::{Sim, SimHandle};
-use rerun::{Arrows3D, Color, LineStrips3D, RecordingStream, Scalars, Vec3D};
+use rerun::{Arrows3D, Color, LineStrips3D, Points3D, Position3D, RecordingStream, Scalars, Vec3D};
 
 pub fn setup(
     handle: SimHandle,
@@ -54,11 +54,11 @@ impl RerunLogger {
         let drone = rerun::Asset3D::from_file_path("fpv-drone-2.gltf")?;
         rec.log("drone", &drone)?;
 
-        let cam = rerun::Pinhole::from_fov_and_aspect_ratio(90.0f32.to_radians(), 4.0 / 3.0)
+        let cam = rerun::Pinhole::from_fov_and_aspect_ratio(crate::CAMERA.vfov_rad, 4.0 / 3.0)
             .with_image_plane_distance(0.5);
         rec.log("drone/camera", &cam)?;
 
-        let camera_pitch = 35.0f32.to_radians();
+        let camera_pitch = super::CAMERA.pitch_rad;
         let cam_rot =
             nalgebra::UnitQuaternion::from_euler_angles(PI / 2.0 + camera_pitch, 0.0, PI / 2.0);
         rec.log(
@@ -70,7 +70,7 @@ impl RerunLogger {
         Ok(RerunLogger {
             rec,
             pos_trail: VecDeque::with_capacity(1000),
-            trail_len: 1000,
+            trail_len: 500,
             handle,
             subsample_cfg: subsample,
             subsample_count: 0,
@@ -125,6 +125,40 @@ impl RerunLogger {
         if let Some(gyr_data) = common::signals::COMP_FUSE_GYR.try_get() {
             self.rec
                 .log("sim/firmware/gyr_comp", &Scalars::new(gyr_data))?;
+        }
+
+        if let Some((los_vector, los_rate)) = crate::LOS_VECTOR.try_get() {
+            self.rec.log(
+                "drone/los_vector_pred",
+                &Points3D::new([Position3D::new(los_vector[0], los_vector[1], los_vector[2])])
+                    .with_radii([0.005]),
+            )?;
+            self.rec.log(
+                "drone/los_rate_pred",
+                &Points3D::new([Position3D::new(
+                    los_vector[0] + los_rate[0] * 5.0,
+                    los_vector[1] + los_rate[1] * 5.0,
+                    los_vector[2] + los_rate[2] * 5.0,
+                )])
+                .with_radii([0.005]),
+            )?;
+
+            self.rec.log(
+                "sim/firmware/los_rate_scalar",
+                &Scalars::new([los_rate[0], los_rate[1], los_rate[2]]),
+            )?;
+        }
+
+        if let Some(los_vector_glob) = crate::LOS_VECTOR_LOCAL.try_get() {
+            self.rec.log(
+                "drone/los_vector_measured",
+                &Points3D::new([Position3D::new(
+                    los_vector_glob[0],
+                    los_vector_glob[1],
+                    los_vector_glob[2],
+                )])
+                .with_radii([0.005]),
+            )?;
         }
 
         if let Some(estimate) = common::signals::ESKF_ESTIMATE.try_get() {
