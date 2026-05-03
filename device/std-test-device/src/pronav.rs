@@ -851,3 +851,242 @@ impl EskfLos {
         }
     }
 }
+
+// =============================================================================
+// OOSM wrapper for EskfLos
+// =============================================================================
+
+/// A measurement record stored in the input history.
+#[derive(Clone)]
+struct EskfInput {
+    timestamp: Instant,
+    /// `None` means a predict-only (coast) step; `Some` carries the fused measurement.
+    measurement: Option<EskfMeasurement>,
+}
+
+/// All parameters needed to call `EskfLos::update`.
+#[derive(Clone)]
+struct EskfMeasurement {
+    z_u: Vector3<f32>,
+    p_attitude: Matrix3<f32>,
+    r_pixel: f32,
+}
+
+/// A snapshot of the full `EskfLos` state at a specific time.
+#[derive(Clone)]
+struct EskfSnapshot {
+    timestamp: Instant,
+    filter: EskfLos,
+}
+
+/// Wraps `EskfLos` with out-of-sequence measurement (OOSM) support.
+///
+/// On every call to `fuse` the wrapper either steps forward (in-order) or
+/// rolls back to the nearest prior snapshot, inserts the new measurement in
+/// chronological order, and replays all subsequent inputs — regenerating
+/// snapshots as it goes.  `predict_to` extrapolates the current state to an
+/// arbitrary future time without touching the persistent history.
+pub struct OosmEskfLos {
+    /// The live filter state (always at `current_time` after each call).
+    filter: EskfLos,
+    /// Monotonically non-decreasing timestamp of the last committed step.
+    current_time: Option<Instant>,
+    /// Ring of post-step filter snapshots, oldest first.
+    snapshots: VecDeque<EskfSnapshot>,
+    /// Ring of all inputs (predict + update), kept in chronological order.
+    inputs: VecDeque<EskfInput>,
+    /// Maximum number of snapshots / inputs to retain.
+    capacity: usize,
+}
+
+impl OosmEskfLos {
+    /// Create a new wrapper with the given inner filter and ring-buffer capacity.
+    ///
+    /// `capacity` controls how far back OOSM rollback can reach.  At 100 Hz
+    /// a capacity of 100 covers 1 second of history.
+    pub fn new(filter: EskfLos, capacity: usize) -> Self {
+        Self {
+            filter,
+            current_time: None,
+            snapshots: VecDeque::with_capacity(capacity),
+            inputs: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    // ── internal helpers ──────────────────────────────────────────────────────
+
+    fn save_snapshot(&mut self, timestamp: Instant) {
+        if self.snapshots.len() == self.capacity {
+            self.snapshots.pop_front();
+        }
+        self.snapshots.push_back(EskfSnapshot {
+            timestamp,
+            filter: self.filter.clone(),
+        });
+    }
+
+    fn record_input(&mut self, input: EskfInput) {
+        if self.inputs.len() == self.capacity {
+            self.inputs.pop_front();
+        }
+        // Insert in chronological order (binary search on timestamp).
+        let pos = self
+            .inputs
+            .partition_point(|i| i.timestamp <= input.timestamp);
+        self.inputs.insert(pos, input);
+    }
+
+    fn restore_snapshot(&mut self, snap: &EskfSnapshot) {
+        self.filter = snap.filter.clone();
+        self.current_time = Some(snap.timestamp);
+    }
+
+    fn step_input(&mut self, input: &EskfInput) {
+        let dt = self
+            .current_time
+            .map(|t| {
+                if input.timestamp > t {
+                    (input.timestamp - t).as_micros() as f32 * 1e-6
+                } else {
+                    0.0
+                }
+            })
+            .unwrap_or(0.0);
+
+        self.filter.predict(dt);
+
+        if let Some(m) = &input.measurement {
+            self.filter.update(m.z_u, m.p_attitude, m.r_pixel);
+        }
+
+        self.current_time = Some(input.timestamp);
+        self.save_snapshot(input.timestamp);
+    }
+
+    // ── public API ────────────────────────────────────────────────────────────
+
+    /// Fuse a new LOS measurement at its true capture timestamp.
+    ///
+    /// If the measurement is in-order (timestamp ≥ current_time) this is a
+    /// simple predict+update forward step.  If it is out-of-sequence the
+    /// wrapper rolls back to the nearest snapshot before `timestamp`, inserts
+    /// the new measurement into the sorted input history, and replays all
+    /// inputs from that point to the present.
+    pub fn fuse(
+        &mut self,
+        timestamp: Instant,
+        z_u: Vector3<f32>,
+        p_attitude: Matrix3<f32>,
+        r_pixel: f32,
+    ) {
+        let meas = Some(EskfMeasurement {
+            z_u,
+            p_attitude,
+            r_pixel,
+        });
+
+        let is_oosm = self.current_time.map_or(false, |t| timestamp < t);
+
+        if !is_oosm {
+            // ── In-order: simple forward step ──────────────────────────────
+            let input = EskfInput {
+                timestamp,
+                measurement: meas,
+            };
+            self.step_input(&input);
+            // record_input after step_input so the snapshot is already saved
+            self.record_input(input);
+            return;
+        }
+
+        // ── Out-of-sequence: rollback and replay ───────────────────────────
+
+        // 1. Insert the new measurement in chronological order.
+        self.record_input(EskfInput {
+            timestamp,
+            measurement: meas,
+        });
+
+        // 2. Find the latest snapshot strictly before the measurement time.
+        let rollback_idx = self
+            .snapshots
+            .iter()
+            .rposition(|s| s.timestamp < timestamp);
+
+        let replay_from = if let Some(idx) = rollback_idx {
+            let snap = self.snapshots[idx].clone();
+            let t = snap.timestamp;
+            self.restore_snapshot(&snap);
+            // Drop all snapshots after the rollback point; they'll be regenerated.
+            self.snapshots.truncate(idx + 1);
+            t
+        } else {
+            // No old-enough snapshot — reset and replay from the very beginning.
+            self.filter.reset();
+            self.current_time = None;
+            self.snapshots.clear();
+            self.inputs
+                .front()
+                .map(|i| i.timestamp)
+                .unwrap_or(timestamp)
+        };
+
+        // 3. Collect and replay every input strictly after the rollback point.
+        //    We clone indices to avoid borrowing `self` while mutating it.
+        let to_replay: Vec<EskfInput> = self
+            .inputs
+            .iter()
+            .filter(|i| i.timestamp > replay_from)
+            .cloned()
+            .collect();
+
+        for input in &to_replay {
+            self.step_input(input);
+        }
+    }
+
+    /// Advance the filter to `now` without a measurement (coast / dead-reckoning).
+    ///
+    /// This *is* recorded in the input history so that OOSM replays stay
+    /// consistent with the predict steps that the controller has already seen.
+    pub fn predict_step(&mut self, now: Instant) {
+        let input = EskfInput {
+            timestamp: now,
+            measurement: None,
+        };
+        self.step_input(&input);
+        self.record_input(input);
+    }
+
+    /// Extrapolate the current filter state to `now` without modifying history.
+    ///
+    /// Use this from the controller tick to get the best current estimate
+    /// without committing a coast step that would pollute future replays.
+    pub fn predict_to(&self, now: Instant) -> (Vector3<f32>, Vector3<f32>) {
+        let dt = self
+            .current_time
+            .map(|t| {
+                if now > t {
+                    (now - t).as_micros() as f32 * 1e-6
+                } else {
+                    0.0
+                }
+            })
+            .unwrap_or(0.0);
+
+        if dt < 1e-9 {
+            return (self.filter.u_hat, self.filter.omega_hat);
+        }
+
+        // Clone and step — no side effects on `self`.
+        let mut tmp = self.filter.clone();
+        tmp.predict(dt);
+        (tmp.u_hat, tmp.omega_hat)
+    }
+
+    /// The current committed estimate (at `current_time`, not extrapolated).
+    pub fn current_estimate(&self) -> (Vector3<f32>, Vector3<f32>) {
+        (self.filter.u_hat, self.filter.omega_hat)
+    }
+}
