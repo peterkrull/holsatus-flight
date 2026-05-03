@@ -729,6 +729,17 @@ fn compute_initial_basis(u: &Vector3<f32>) -> SMatrix<f32, 3, 2> {
     SMatrix::from_columns(&[b1, b2])
 }
 
+/// Helper: Creates a skew-symmetric cross-product matrix for a given 3D vector.
+#[rustfmt::skip]
+fn skew_symmetric(v: &Vector3<f32>) -> Matrix3<f32> {
+    Matrix3::new(
+        0.0, -v.z, v.y,
+        v.z, 0.0, -v.x,
+        -v.y, v.x, 0.0
+    )
+}
+
+#[derive(Debug, Clone)]
 pub struct EskfLos {
     /// Global nominal 3D unit LOS vector
     pub u_hat: Vector3<f32>,
@@ -736,18 +747,15 @@ pub struct EskfLos {
     pub omega_hat: Vector3<f32>,
     /// Basis for the tangent space of the unit sphere at u_hat
     pub basis: SMatrix<f32, 3, 2>,
-
-    /// 4x4 Error state covariance matrix [d_theta_1, d_theta_2, d_omega_1, d_omega_2]
+    /// 4x4 Error state covariance matrix
     pub p_cov: SMatrix<f32, 4, 4>,
     /// 4x4 Process noise covariance matrix
     pub q_cov: SMatrix<f32, 4, 4>,
-    /// 3x3 Baseline pixel measurement noise covariance (in global frame)
-    pub r_pixel: SMatrix<f32, 3, 3>,
 }
 
 impl EskfLos {
     /// Construct a new ESKF LOS tracker.
-    pub fn new(q_cov: SMatrix<f32, 4, 4>, r_pixel: f32) -> Self {
+    pub fn new(q_cov: SMatrix<f32, 4, 4>) -> Self {
         let u_initial = Vector3::new(1.0, 0.0, 0.0);
         Self {
             u_hat: u_initial,
@@ -755,7 +763,6 @@ impl EskfLos {
             basis: compute_initial_basis(&u_initial),
             p_cov: SMatrix::identity(),
             q_cov,
-            r_pixel: SMatrix::identity() * r_pixel,
         }
     }
 
@@ -795,7 +802,8 @@ impl EskfLos {
     /// Update the filter with a new visual LOS measurement.
     /// `z_u`: The measured 3D unit vector, already rotated into the global inertial frame.
     /// `p_attitude`: The 3x3 covariance matrix from the host vehicle's attitude estimator.
-    pub fn update(&mut self, z_u: Vector3<f32>, p_attitude: Matrix3<f32>) {
+    /// `r_pixel`: The baseline pixel measurement noise covariance (in global frame).
+    pub fn update(&mut self, z_u: Vector3<f32>, p_attitude: Matrix3<f32>, r_pixel: f32) {
         // Measurement Jacobian H (3x4)
         let mut h = SMatrix::<f32, 3, 4>::zeros();
         h.fixed_columns_mut::<2>(0).copy_from(&self.basis);
@@ -805,7 +813,7 @@ impl EskfLos {
 
         // Measurement Covariance R (incorporating host attitude uncertainty)
         let z_skew = skew_symmetric(&z_u);
-        let r_cov = self.r_pixel + z_skew * p_attitude * z_skew.transpose();
+        let r_cov = SMatrix::identity() * r_pixel + z_skew * p_attitude * z_skew.transpose();
 
         // Innovation Covariance S and Kalman Gain K
         let s = h * self.p_cov * h.transpose() + r_cov;
@@ -842,30 +850,4 @@ impl EskfLos {
             log::error!("ESKF innovation covariance matrix is singular");
         }
     }
-}
-
-/// Helper: Creates a skew-symmetric cross-product matrix for a given 3D vector.
-#[rustfmt::skip]
-fn skew_symmetric(v: &Vector3<f32>) -> Matrix3<f32> {
-    Matrix3::new(
-        0.0, -v.z, v.y,
-        v.z, 0.0, -v.x,
-        -v.y, v.x, 0.0
-    )
-}
-
-/// Helper: Generates a 3x2 matrix whose columns form an orthonormal basis
-/// for the tangent plane perpendicular to the given unit vector `u`.
-fn compute_tangent_basis(u: &Vector3<f32>) -> SMatrix<f32, 3, 2> {
-    // Pick an arbitrary vector that is not perfectly aligned with `u`
-    let mut v = Vector3::new(1.0, 0.0, 0.0);
-    if u.x.abs() > 0.9 {
-        v = Vector3::new(0.0, 1.0, 0.0);
-    }
-
-    // Gram-Schmidt / Cross-product to find two orthogonal basis vectors
-    let b1 = u.cross(&v).normalize();
-    let b2 = u.cross(&b1).normalize();
-
-    SMatrix::from_columns(&[b1, b2])
 }
